@@ -24,7 +24,7 @@ ARG TARGETARCH
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
     GOOS=$TARGETOS GOARCH=$TARGETARCH go build -p 2 -mod=readonly -trimpath \
-      -ldflags="-s -w -X github.com/minio/minio/cmd.Version=2025-10-15T17:29:55Z -X github.com/minio/minio/cmd.ReleaseTag=RELEASE.2025-10-15T17-29-55Z.openimage.1 -X github.com/minio/minio/cmd.CommitID=9e49d5e7a648f00e26f2246f4dc28e6b07f8c84a" \
+      -ldflags="-s -w -X github.com/minio/minio/cmd.Version=2025-10-15T17:29:55Z -X github.com/minio/minio/cmd.ReleaseTag=RELEASE.2025-10-15T17-29-55Z.openimage.1 -X github.com/minio/minio/cmd.CommitID=9e49d5e7a648f00e26f2246f4dc28e6b07f8c84a -X github.com/minio/minio/cmd.ShortCommitID=9e49d5e7a648 -X github.com/minio/minio/cmd.CopyrightYear=2025" \
       -o /out/minio .
 RUN mkdir -p /rootfs/data /rootfs/tmp /rootfs/etc /rootfs/usr/share/minio \
     && chmod 1777 /rootfs/tmp \
@@ -35,7 +35,7 @@ COPY LICENSE NOTICE /rootfs/usr/share/minio/
 
 FROM source AS archive
 RUN --mount=type=cache,target=/go/pkg/mod go mod vendor
-COPY Dockerfile LICENSE NOTICE /src/_openimage/
+COPY Dockerfile LICENSE NOTICE README.md SECURITY.md /src/_openimage/
 COPY scripts/ /src/_openimage/scripts/
 COPY patches/ /src/_openimage/patches/
 COPY dependencies/ /src/_openimage/dependencies/
