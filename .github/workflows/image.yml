@@ -68,6 +68,8 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Require a public Docker Hub repository
+        run: curl -fsS https://hub.docker.com/v2/namespaces/openimage/repositories/minio | jq -e '.is_private == false' >/dev/null
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: release
@@ -84,7 +86,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          sha256sum build/minio-source.tar.gz reports/*.json > SHA256SUMS
+          (cd build && sha256sum minio-source.tar.gz) > SHA256SUMS
+          (cd reports && sha256sum *.json) >> SHA256SUMS
           cat > release-notes.md <<'EOF'
           MinIO source build with OpenImage security backports.
           The source archive contains vendored dependencies. Review raw.json
@@ -98,3 +101,5 @@ jobs:
           docker load --input build/image.tar
           docker tag openimage/minio:ci "openimage/minio:$GITHUB_REF_NAME"
           docker push "openimage/minio:$GITHUB_REF_NAME"
+      - name: Verify anonymous registry access
+        run: docker --config "$RUNNER_TEMP/docker-anonymous" manifest inspect "openimage/minio:$GITHUB_REF_NAME" >/dev/null

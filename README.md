@@ -65,7 +65,10 @@ MinIO count still needs to be reconciled against its exact CVE IDs.
 
 Pushes, pull requests, and weekly scheduled runs build, test, and scan. To publish,
 configure the GitHub Actions secret `DOCKERHUB_TOKEN` with write access to
-`openimage/minio`, then create and push a `v*` tag. Release builds upload matching
+`openimage/minio`, ensure that repository's Docker Hub visibility is **Public**,
+then create and push a `v*` tag. A token that can push images may not have
+permission to change repository visibility; configure that in Docker Hub's
+repository settings. Release builds verify public access and upload matching
 source and security reports before pushing the tested image to Docker Hub.
 Publication uses version tags; there is no automatic mutable `latest` tag.
 
