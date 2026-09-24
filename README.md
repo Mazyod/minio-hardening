@@ -4,6 +4,16 @@ An independent, open-source MinIO image maintained for `openimage/minio` on
 Docker Hub. Built from pinned source with security backports and updated Go
 dependencies. Licensed under [AGPL-3.0-or-later](LICENSE).
 
+**The full management console is preserved in v0.2.0.** It uses the same
+`github.com/minio/console v1.7.6` as the April 2025 reference image, including
+user, group, policy, access-key, and bucket administration. The server retains
+the newer security fixes. Version `v0.1.0` used the reduced object browser;
+use `v0.2.0` when the full console is required.
+
+```sh
+docker pull openimage/minio:v0.2.0
+```
+
 The upstream community repository is archived. This project carries an explicit
 patch set; upgrading the operating-system layer alone does not fix MinIO or its
 embedded Go libraries. See [security status and compatibility](SECURITY.md).
@@ -23,6 +33,9 @@ docker build --pull -t openimage/minio:local .
 ```
 
 Every image build runs the security regression tests before compiling MinIO.
+The smoke test checks all 77 original console JavaScript/CSS assets and exercises
+login, users, groups, policies, access keys, buckets, and versioning through the
+console API. The scan gate also checks that the full-console module is present.
 Supply your own credentials; missing credentials and `minioadmin:minioadmin`
 are rejected. MinIO's `MINIO_ROOT_USER_FILE` and `MINIO_ROOT_PASSWORD_FILE`
 settings are also supported for mounted secrets.
@@ -72,7 +85,9 @@ repository settings. Release builds verify public access and upload matching
 source and security reports before pushing the tested image to Docker Hub.
 Publication uses version tags; there is no automatic mutable `latest` tag.
 
-The source archive includes the modified MinIO source and vendored dependencies:
+The source archive includes the modified MinIO source, vendored dependencies,
+and the full console source and frontend build files under
+`_openimage/console-source`:
 
 ```sh
 docker build --target source-export --output type=local,dest=build .

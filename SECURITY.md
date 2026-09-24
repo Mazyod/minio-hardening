@@ -9,6 +9,10 @@ exploit details in public issues. Support targets the latest project release.
 Base: MinIO `RELEASE.2025-10-15T17-29-55Z`, commit
 `9e49d5e7a648f00e26f2246f4dc28e6b07f8c84a`.
 
+Console: `github.com/minio/console v1.7.6`, matching the full management console
+in `RELEASE.2025-04-08T15-41-24Z`. Preserving these console features is a release
+requirement. The server security baseline and backports remain unchanged.
+
 | Finding | Treatment | Verification |
 | --- | --- | --- |
 | RabbitMQ Go client v1.10.0 | Pin `amqp091-go` v1.15.0, including the fixes in v1.13 and v1.14 | Embedded-module scan; compiled MinIO integration tests |
@@ -41,8 +45,11 @@ hunk only. Patch 12 is this project's explicit-credentials startup requirement.
   permitted anonymous bucket writes retain regression coverage.
 - The removed ReadMultiple API had no production callers in the pinned base.
   Older nodes that still call it must not be mixed into a deployment.
-- The UI comes from the final community source release. This image does not
-  restore earlier administrative console features.
+- Starting with v0.2.0, the full April 2025 console is retained. All 77 original
+  JavaScript/CSS assets are checked by hash, and management API regressions cover
+  login, users, groups, policies, access keys, buckets, and versioning. Version
+  v0.1.0 shipped the reduced object browser and does not meet this compatibility
+  requirement.
 - The bundled `mc` client from the reference image is not included. Workflows
   that invoke `mc` inside the server container need a separate client image.
 - Tests cover the listed regressions and a single-node S3 smoke flow. They do not
@@ -57,6 +64,13 @@ component versions. Only the explicitly listed backports and proven absent
 OpenPGP code are classified; every other finding fails the release gate.
 The VEX dispositions are project assertions backed by these patches and tests,
 not independent certification. A clean adjusted report is not a zero-CVE claim.
+The SBOM gate requires console v1.7.6 as well as the pinned MinIO and AMQP modules;
+an image with the reduced console fails even if its vulnerability assessment passes.
+
+The full-console candidate for v0.2.0 was also scanned with the database below:
+it retains 7 raw findings and 0 after the same documented VEX assessment. No
+additional finding was introduced by restoring the full console. The management
+tests pass against both the reference image and the hardened candidate.
 
 ## Reference image comparison
 

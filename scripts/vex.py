@@ -40,9 +40,9 @@ def generate(report, sbom):
     if not product.startswith("pkg:oci/") or "@sha256:" not in product:
         raise ValueError("VEX requires an image PURL pinned to its digest")
     packages = {(c.get("name"), c.get("version")) for c in sbom.get("components", [])}
-    expected = {("github.com/minio/minio", MINIO_VERSION), ("github.com/rabbitmq/amqp091-go", "v1.15.0")}
+    expected = {("github.com/minio/minio", MINIO_VERSION), ("github.com/rabbitmq/amqp091-go", "v1.15.0"), ("github.com/minio/console", "v1.7.6")}
     if not expected <= packages:
-        raise ValueError("SBOM does not identify the pinned MinIO and AMQP modules")
+        raise ValueError("SBOM does not identify the pinned MinIO, AMQP, and full-console modules")
     statements = []
     for result in report.get("Results", []):
         for vuln in result.get("Vulnerabilities", []):

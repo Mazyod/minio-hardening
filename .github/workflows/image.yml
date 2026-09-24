@@ -35,7 +35,7 @@ jobs:
         env:
           REVISION: ${{ github.sha }}
         run: docker buildx build --platform linux/amd64 --load --build-arg REVISION="$REVISION" -t openimage/minio:ci .
-      - name: Smoke test
+      - name: Smoke test S3 and full console
         run: ./scripts/smoke.sh openimage/minio:ci
       - name: Scan and assess known backports
         run: ./scripts/scan.sh openimage/minio:ci
@@ -89,8 +89,11 @@ jobs:
           (cd build && sha256sum minio-source.tar.gz) > SHA256SUMS
           (cd reports && sha256sum *.json) >> SHA256SUMS
           cat > release-notes.md <<'EOF'
-          MinIO source build with OpenImage security backports.
-          The source archive contains vendored dependencies. Review raw.json
+          MinIO security backports with the full April 2025 management console
+          (console v1.7.6). Unlike v0.1.0, this release retains user, group,
+          policy, access-key, and bucket administration. CI checks all 77 original
+          JavaScript/CSS assets and exercises the console management APIs.
+          The source archive contains vendored dependencies and full console source. Review raw.json
           together with the image-specific vex.json and assessed.json.
           Image: docker.io/openimage/minio, using this release's version tag.
           EOF

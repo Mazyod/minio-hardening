@@ -23,13 +23,15 @@ MINIO_ROOT_PASSWORD=$(python3 -c 'import secrets; print(secrets.token_hex(24))')
 export MINIO_ROOT_PASSWORD
 container=$(docker run -d --read-only --cap-drop ALL \
     --security-opt no-new-privileges:true --tmpfs /tmp:rw,noexec,nosuid,size=64m \
-    --volume /data -p 127.0.0.1::9000 \
+    --volume /data -p 127.0.0.1::9000 -p 127.0.0.1::9001 \
     -e MINIO_ROOT_USER -e MINIO_ROOT_PASSWORD "$image")
 [[ "$(docker inspect --format '{{.Config.User}}' "$container")" == '10001:10001' ]]
 endpoint="http://$(docker port "$container" 9000/tcp)"
+console_endpoint="http://$(docker port "$container" 9001/tcp)"
 ready() {
     for _ in {1..60}; do
-        if curl -fsS "$endpoint/minio/health/ready" >/dev/null 2>&1; then return; fi
+        if curl -fsS "$endpoint/minio/health/ready" >/dev/null 2>&1 \
+            && curl -fsS "$console_endpoint/api/v1/login" >/dev/null 2>&1; then return; fi
         sleep 1
     done
     echo 'MinIO did not become ready' >&2
@@ -40,12 +42,14 @@ s3() {
         --user "$MINIO_ROOT_USER:$MINIO_ROOT_PASSWORD" "$@"
 }
 ready
+python3 "$(dirname "$0")/console_test.py" "$console_endpoint"
 s3 -X PUT "$endpoint/smoke-bucket"
 s3 -X PUT --data-binary 'openimage-smoke-test' "$endpoint/smoke-bucket/object"
 [[ "$(s3 "$endpoint/smoke-bucket/object")" == 'openimage-smoke-test' ]]
 [[ "$(curl -s -o /dev/null -w '%{http_code}' "$endpoint/smoke-bucket/object")" == 403 ]]
 docker restart "$container" >/dev/null
 endpoint="http://$(docker port "$container" 9000/tcp)"
+console_endpoint="http://$(docker port "$container" 9001/tcp)"
 ready
 [[ "$(s3 "$endpoint/smoke-bucket/object")" == 'openimage-smoke-test' ]]
 s3 -X DELETE "$endpoint/smoke-bucket/object"

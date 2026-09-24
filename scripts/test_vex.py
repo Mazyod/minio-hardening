@@ -14,11 +14,14 @@ class VexTest(unittest.TestCase):
         sbom = {"metadata": {"component": {"purl": root}}, "components": [
             {"name": "github.com/minio/minio", "version": MINIO_VERSION},
             {"name": "github.com/rabbitmq/amqp091-go", "version": "v1.15.0"},
+            {"name": "github.com/minio/console", "version": "v1.7.6"},
         ]}
         document = generate({"Results": [{"Vulnerabilities": [vuln]}]}, sbom)
         self.assertEqual(document["statements"][0]["products"], [{"@id": root, "subcomponents": [{"@id": vuln["PkgIdentifier"]["PURL"]}]}])
         with self.assertRaises(ValueError):
             generate({}, sbom | {"components": []})
+        with self.assertRaises(ValueError):
+            generate({}, sbom | {"components": sbom["components"][:2]})
         with self.assertRaises(ValueError):
             generate({}, {"metadata": {"component": {"purl": "pkg:oci/minio@latest"}}})
 

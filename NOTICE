@@ -17,4 +17,6 @@ OpenImage build recipes and original changes: Copyright 2026 OpenImage
 contributors, under the GNU Affero General Public License, version 3 or later.
 
 Third-party dependencies retain their own licenses. Release source archives
-include vendored dependencies and their notices.
+include vendored dependencies and their notices. The full MinIO Console v1.7.6
+source, including its frontend source and build files, is included separately
+under _openimage/console-source in the source archive.

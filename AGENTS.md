@@ -20,3 +20,7 @@
 - Retain the AGPL license, upstream notices, and matching source for releases.
 - Prefer a small patch set and standard tools. Do not add deployment-specific
   integrations or unrelated features.
+- Preserve the full MinIO management console from the April 2025 reference
+  image. Do not replace it with the reduced object browser during upgrades.
+  Keep console v1.7.6 pinned until a replacement proves equivalent features;
+  verify UI assets and management APIs in the smoke test.

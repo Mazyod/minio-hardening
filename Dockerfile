@@ -24,7 +24,7 @@ ARG TARGETARCH
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
     GOOS=$TARGETOS GOARCH=$TARGETARCH go build -p 2 -mod=readonly -trimpath \
-      -ldflags="-s -w -X github.com/minio/minio/cmd.Version=2025-10-15T17:29:55Z -X github.com/minio/minio/cmd.ReleaseTag=RELEASE.2025-10-15T17-29-55Z.openimage.1 -X github.com/minio/minio/cmd.CommitID=9e49d5e7a648f00e26f2246f4dc28e6b07f8c84a -X github.com/minio/minio/cmd.ShortCommitID=9e49d5e7a648 -X github.com/minio/minio/cmd.CopyrightYear=2025" \
+      -ldflags="-s -w -X github.com/minio/minio/cmd.Version=2025-10-15T17:29:55Z -X github.com/minio/minio/cmd.ReleaseTag=RELEASE.2025-10-15T17-29-55Z.openimage.2 -X github.com/minio/minio/cmd.CommitID=9e49d5e7a648f00e26f2246f4dc28e6b07f8c84a -X github.com/minio/minio/cmd.ShortCommitID=9e49d5e7a648 -X github.com/minio/minio/cmd.CopyrightYear=2025" \
       -o /out/minio .
 RUN mkdir -p /rootfs/data /rootfs/tmp /rootfs/etc /rootfs/usr/share/minio \
     && chmod 1777 /rootfs/tmp \
@@ -34,7 +34,9 @@ RUN mkdir -p /rootfs/data /rootfs/tmp /rootfs/etc /rootfs/usr/share/minio \
 COPY LICENSE NOTICE /rootfs/usr/share/minio/
 
 FROM source AS archive
-RUN --mount=type=cache,target=/go/pkg/mod go mod vendor
+RUN --mount=type=cache,target=/go/pkg/mod go mod vendor \
+    && mkdir -p /src/_openimage \
+    && cp -a /go/pkg/mod/github.com/minio/console@v1.7.6 /src/_openimage/console-source
 COPY Dockerfile LICENSE NOTICE README.md SECURITY.md /src/_openimage/
 COPY scripts/ /src/_openimage/scripts/
 COPY patches/ /src/_openimage/patches/
@@ -51,7 +53,7 @@ COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certifica
 COPY --from=build /usr/share/zoneinfo /usr/share/zoneinfo
 ARG REVISION=local
 LABEL org.opencontainers.image.title="OpenImage MinIO" \
-      org.opencontainers.image.description="MinIO source build with security backports" \
+      org.opencontainers.image.description="MinIO security backports with the full management console" \
       org.opencontainers.image.source="https://github.com/Mazyod/minio-hardening" \
       org.opencontainers.image.licenses="AGPL-3.0-or-later" \
       org.opencontainers.image.revision=$REVISION
