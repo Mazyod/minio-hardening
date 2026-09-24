@@ -43,6 +43,8 @@ hunk only. Patch 12 is this project's explicit-credentials startup requirement.
   Older nodes that still call it must not be mixed into a deployment.
 - The UI comes from the final community source release. This image does not
   restore earlier administrative console features.
+- The bundled `mc` client from the reference image is not included. Workflows
+  that invoke `mc` inside the server container need a separate client image.
 - Tests cover the listed regressions and a single-node S3 smoke flow. They do not
   certify distributed upgrades, every external identity provider, or all
   replication topologies. Back up data and test an upgrade before deployment.
@@ -56,6 +58,48 @@ OpenPGP code are classified; every other finding fails the release gate.
 The VEX dispositions are project assertions backed by these patches and tests,
 not independent certification. A clean adjusted report is not a zero-CVE claim.
 
-The original image digest and scanner CVE IDs are still needed to reconcile the
-reported nine MinIO and ten RabbitMQ findings one by one. Counts alone cannot
-establish which issues were present or prove they are all resolved.
+## Reference image comparison
+
+Reference: `quay.io/minio/minio:RELEASE.2025-04-08T15-41-24Z`, pinned to
+`quay.io/minio/minio@sha256:8834ae47a2de3509b83e0e70da9369c24bbbc22de42f2a2eddc530eee88acd1b`.
+The scanned platform is Linux amd64. Its embedded server module is
+`github.com/minio/minio v0.0.0-20250408154124-d0cada583fce+dirty`.
+This is the comparison baseline; the hardened build uses the newer source
+release and security backports listed above.
+
+Scanned on 2026-09-24 with Trivy 0.74.0 and vulnerability database updated
+2026-09-23T20:20:57Z. Both images used that database, all severities, and no
+ignore file. The hardened recipe was commit
+`b5c8d7308de72ed59ef50ee91fff26174db90729`.
+
+| Scope | Reference raw findings | Hardened raw findings | Hardened after VEX |
+| --- | ---: | ---: | ---: |
+| RabbitMQ Go client in server | 10 | 0 | 0 |
+| MinIO server module | 7 | 6 | 0 |
+| Other server dependencies and Go runtime | 104 | 1 | 0 |
+| Bundled `mc` client | 93 | Not included | Not included |
+| Operating-system packages | 91 | 0 | 0 |
+| **Total finding occurrences** | **305** | **7** | **0** |
+
+The reference has 161 distinct vulnerability IDs; a vulnerability can occur in
+multiple packages or binaries. Removed components are not counted as patched.
+The hardened runtime uses `scratch` and does not ship the reference image's OS
+packages or `mc` binary. The seven remaining raw findings are the six MinIO
+backports detected by Trivy and the absent OpenPGP code discussed above.
+
+The ten RabbitMQ findings are CVE-2026-77403, CVE-2026-77404,
+CVE-2026-77405, CVE-2026-77406, CVE-2026-77407, CVE-2026-77408,
+CVE-2026-77410, CVE-2026-77411, CVE-2026-77412, and CVE-2026-79921.
+All ten have a fixed-version floor of v1.13.0 in this scan; the hardened binary
+contains v1.15.0 and reports none of them.
+
+The seven detected MinIO findings are CVE-2025-62506 and CVE-2026-33322,
+CVE-2026-33419, CVE-2026-34204, CVE-2026-39414, CVE-2026-40344, and
+CVE-2026-41145. The newer upstream release fixes CVE-2025-62506; source
+backports address the other six. CVE-2026-42600 is additionally backported,
+although this scanner does not report it for the reference image.
+
+This reproduces the reported RabbitMQ count of ten. It detects seven MinIO
+findings rather than the reported nine. The original scanner's CVE IDs are
+still needed to reconcile that difference; identical counts alone would not
+prove identical coverage.

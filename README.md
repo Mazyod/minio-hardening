@@ -56,8 +56,10 @@ MinIO's module identity and original upstream revision remain visible.
 and scan after applying that document. Version-based scanners still report
 backported fixes unless they consume the VEX evidence. This is **not a claim of
 zero raw scanner findings**. Unknown findings of any severity block publication.
-The original scanner's reported counts still need to be reconciled against its
-exact CVE IDs and image digest.
+The reference image is `quay.io/minio/minio:RELEASE.2025-04-08T15-41-24Z`.
+Its pinned digest and before/after scan are recorded in
+[SECURITY.md](SECURITY.md#reference-image-comparison). The original scanner's
+MinIO count still needs to be reconciled against its exact CVE IDs.
 
 ## Publishing and maintenance
 
