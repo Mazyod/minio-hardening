@@ -35,10 +35,10 @@ COPY LICENSE NOTICE /rootfs/usr/share/minio/
 
 FROM source AS archive
 RUN --mount=type=cache,target=/go/pkg/mod go mod vendor
-COPY Dockerfile LICENSE NOTICE /src/openimage/
-COPY scripts/ /src/openimage/scripts/
-COPY patches/ /src/openimage/patches/
-COPY dependencies/ /src/openimage/dependencies/
+COPY Dockerfile LICENSE NOTICE /src/_openimage/
+COPY scripts/ /src/_openimage/scripts/
+COPY patches/ /src/_openimage/patches/
+COPY dependencies/ /src/_openimage/dependencies/
 RUN mkdir -p /out \
     && tar --exclude=.git -czf /out/minio-source.tar.gz -C /src .
 FROM scratch AS source-export
