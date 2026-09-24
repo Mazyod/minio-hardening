@@ -1,0 +1,709 @@
+From 3b950f8fa8576639c813c7aaeb60d93f9968ace5 Mon Sep 17 00:00:00 2001
+From: Feng Ruohang <rh@vonng.com>
+Date: Wed, 15 Apr 2026 13:49:51 +0800
+Subject: [PATCH] fix: CVE-2026-33419 harden LDAP STS auth
+
+Prevent username enumeration in AssumeRoleWithLDAPIdentity by returning the same external STS error for unknown users and invalid passwords, while preserving LDAP infrastructure failures as upstream errors so they continue to surface as 500s and remain visible in server logs.
+
+Add a small in-memory rate limiter for LDAP STS login attempts, keyed by source IP and normalized username, and add regression coverage for auth failure classification, throttling, and Docker-backed LDAP end-to-end flows.
+
+Co-authored-by: Codex <codex@openai.com>
+Co-authored-by: Claude Code <claude-code@anthropic.com>
+---
+ cmd/admin-handlers-idp-ldap.go             |   2 +-
+ cmd/sts-handlers.go                        | 128 +++++++-
+ cmd/sts-handlers_test.go                   | 341 +++++++++++++++++++++
+ internal/config/identity/ldap/ldap.go      |  45 ++-
+ internal/config/identity/ldap/ldap_test.go |  45 +++
+ 5 files changed, 555 insertions(+), 6 deletions(-)
+ create mode 100644 internal/config/identity/ldap/ldap_test.go
+
+diff --git a/cmd/admin-handlers-idp-ldap.go b/cmd/admin-handlers-idp-ldap.go
+index 6807de18c19ec..99512c119ea33 100644
+--- a/cmd/admin-handlers-idp-ldap.go
++++ b/cmd/admin-handlers-idp-ldap.go
+@@ -267,7 +267,7 @@ func (a adminAPIHandlers) AddServiceAccountLDAP(w http.ResponseWriter, r *http.R
+ 		lookupResult, targetGroups, err = globalIAMSys.LDAPConfig.LookupUserDN(targetUser)
+ 		if err != nil {
+ 			// if not found, check if DN
+-			if strings.Contains(err.Error(), "User DN not found for:") {
++			if strings.Contains(strings.ToLower(err.Error()), "user dn not found for:") {
+ 				if isDN {
+ 					// warn user that DNs are not allowed
+ 					writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErrWithErr(ErrAdminLDAPExpectedLoginName, err), r.URL)
+diff --git a/cmd/sts-handlers.go b/cmd/sts-handlers.go
+index c4092bca3bcd2..21e2195414f3a 100644
+--- a/cmd/sts-handlers.go
++++ b/cmd/sts-handlers.go
+@@ -29,17 +29,21 @@ import (
+ 	"net/url"
+ 	"strconv"
+ 	"strings"
++	"sync"
+ 	"time"
+ 
+ 	"github.com/minio/madmin-go/v3"
+ 	"github.com/minio/minio/internal/auth"
++	idldap "github.com/minio/minio/internal/config/identity/ldap"
+ 	"github.com/minio/minio/internal/config/identity/openid"
++	"github.com/minio/minio/internal/handlers"
+ 	"github.com/minio/minio/internal/hash/sha256"
+ 	xhttp "github.com/minio/minio/internal/http"
+ 	"github.com/minio/minio/internal/logger"
+ 	"github.com/minio/mux"
+ 	"github.com/minio/pkg/v3/policy"
+ 	"github.com/minio/pkg/v3/wildcard"
++	"golang.org/x/time/rate"
+ )
+ 
+ const (
+@@ -91,6 +95,15 @@ const (
+ 
+ 	// maximum supported STS session policy size
+ 	maxSTSSessionPolicySize = 2048
++
++	stsLDAPLoginBurst         = 10
++	stsLDAPLoginEntryTTL      = 15 * time.Minute
++	stsLDAPLoginRetryAfterSec = int((time.Minute / stsLDAPLoginBurst) / time.Second)
++)
++
++var (
++	errLDAPAuthenticationFailed   = errors.New("LDAP authentication failed")
++	globalSTSLDAPLoginRateLimiter = newSTSLDAPLoginRateLimiter(time.Minute/time.Duration(stsLDAPLoginBurst), stsLDAPLoginBurst, stsLDAPLoginEntryTTL)
+ )
+ 
+ type stsClaims map[string]any
+@@ -254,6 +267,109 @@ func getTokenSigningKey() (string, error) {
+ 	return secret, nil
+ }
+ 
++type stsLDAPLoginRateLimiter struct {
++	source *stsLDAPLoginKeyLimiterSet
++	user   *stsLDAPLoginKeyLimiterSet
++}
++
++type stsLDAPLoginKeyLimiterSet struct {
++	mu          sync.Mutex
++	refillEvery time.Duration
++	burst       int
++	ttl         time.Duration
++	lastCleanup time.Time
++	entries     map[string]*stsLDAPLoginKeyLimiter
++}
++
++type stsLDAPLoginKeyLimiter struct {
++	limiter  *rate.Limiter
++	lastSeen time.Time
++}
++
++func newSTSLDAPLoginRateLimiter(refillEvery time.Duration, burst int, ttl time.Duration) *stsLDAPLoginRateLimiter {
++	return &stsLDAPLoginRateLimiter{
++		source: newSTSLDAPLoginKeyLimiterSet(refillEvery, burst, ttl),
++		user:   newSTSLDAPLoginKeyLimiterSet(refillEvery, burst, ttl),
++	}
++}
++
++func newSTSLDAPLoginKeyLimiterSet(refillEvery time.Duration, burst int, ttl time.Duration) *stsLDAPLoginKeyLimiterSet {
++	return &stsLDAPLoginKeyLimiterSet{
++		refillEvery: refillEvery,
++		burst:       burst,
++		ttl:         ttl,
++		entries:     make(map[string]*stsLDAPLoginKeyLimiter),
++	}
++}
++
++func (l *stsLDAPLoginRateLimiter) Allow(sourceIP, username string) bool {
++	now := UTCNow()
++	if sourceIP != "" && !l.source.Allow(now, sourceIP) {
++		return false
++	}
++
++	username = strings.ToLower(strings.TrimSpace(username))
++	if username != "" && !l.user.Allow(now, username) {
++		return false
++	}
++
++	return true
++}
++
++func (l *stsLDAPLoginKeyLimiterSet) Allow(now time.Time, key string) bool {
++	l.mu.Lock()
++	defer l.mu.Unlock()
++
++	if l.lastCleanup.IsZero() || now.Sub(l.lastCleanup) >= l.ttl {
++		l.cleanup(now)
++		l.lastCleanup = now
++	}
++
++	entry, ok := l.entries[key]
++	if !ok {
++		entry = &stsLDAPLoginKeyLimiter{
++			limiter:  rate.NewLimiter(rate.Every(l.refillEvery), l.burst),
++			lastSeen: now,
++		}
++		l.entries[key] = entry
++	} else {
++		entry.lastSeen = now
++	}
++
++	return entry.limiter.AllowN(now, 1)
++}
++
++func (l *stsLDAPLoginKeyLimiterSet) cleanup(now time.Time) {
++	for key, entry := range l.entries {
++		if now.Sub(entry.lastSeen) > l.ttl {
++			delete(l.entries, key)
++		}
++	}
++}
++
++func allowSTSLDAPLogin(r *http.Request) bool {
++	return globalSTSLDAPLoginRateLimiter.Allow(handlers.GetSourceIPRaw(r), r.Form.Get(stsLDAPUsername))
++}
++
++func ldapBindErrorToSTS(err error) (STSErrorCode, error) {
++	if idldap.IsAuthError(err) {
++		return ErrSTSInvalidParameterValue, errLDAPAuthenticationFailed
++	}
++	return ErrSTSUpstreamError, nil
++}
++
++func writeSTSThrottledResponse(w http.ResponseWriter) {
++	stsErrorResponse := STSErrorResponse{}
++	stsErrorResponse.Error.Code = "ThrottlingException"
++	stsErrorResponse.Error.Message = "Request throttled, please retry later."
++	stsErrorResponse.RequestID = w.Header().Get(xhttp.AmzRequestID)
++
++	w.Header().Set("Retry-After", strconv.Itoa(stsLDAPLoginRetryAfterSec))
++
++	encodedErrorResponse := encodeResponse(stsErrorResponse)
++	writeResponse(w, http.StatusTooManyRequests, encodedErrorResponse, mimeXML)
++}
++
+ // AssumeRole - implementation of AWS STS API AssumeRole to get temporary
+ // credentials for regular users on Minio.
+ // https://docs.aws.amazon.com/STS/latest/APIReference/API_AssumeRole.html
+@@ -690,10 +806,18 @@ func (sts *stsAPIHandlers) AssumeRoleWithLDAPIdentity(w http.ResponseWriter, r *
+ 		return
+ 	}
+ 
++	if !allowSTSLDAPLogin(r) {
++		writeSTSThrottledResponse(w)
++		return
++	}
++
+ 	lookupResult, groupDistNames, err := globalIAMSys.LDAPConfig.Bind(ldapUsername, ldapPassword)
+ 	if err != nil {
+-		err = fmt.Errorf("LDAP server error: %w", err)
+-		writeSTSErrorResponse(ctx, w, ErrSTSInvalidParameterValue, err)
++		errCode, errResp := ldapBindErrorToSTS(err)
++		if errCode == ErrSTSUpstreamError {
++			stsLogIf(ctx, err, logger.ErrorKind)
++		}
++		writeSTSErrorResponse(ctx, w, errCode, errResp)
+ 		return
+ 	}
+ 	ldapUserDN := lookupResult.NormDN
+diff --git a/cmd/sts-handlers_test.go b/cmd/sts-handlers_test.go
+index a883999e9084e..58786c1f1d50d 100644
+--- a/cmd/sts-handlers_test.go
++++ b/cmd/sts-handlers_test.go
+@@ -20,8 +20,13 @@ package cmd
+ import (
+ 	"bytes"
+ 	"context"
++	"encoding/xml"
++	"errors"
+ 	"fmt"
+ 	"io"
++	"net/http"
++	"net/http/httptest"
++	"net/url"
+ 	"os"
+ 	"reflect"
+ 	"slices"
+@@ -977,6 +982,204 @@ func TestIAMWithLDAPServerSuite(t *testing.T) {
+ 	}
+ }
+ 
++type ldapSTSErrorResult struct {
++	StatusCode int
++	RetryAfter string
++	Code       string
++	Message    string
++	Body       string
++}
++
++func withGlobalSTSLDAPLoginRateLimiterForTest(limiter *stsLDAPLoginRateLimiter, fn func()) {
++	previous := globalSTSLDAPLoginRateLimiter
++	globalSTSLDAPLoginRateLimiter = limiter
++	defer func() {
++		globalSTSLDAPLoginRateLimiter = previous
++	}()
++
++	fn()
++}
++
++func (s *TestSuiteIAM) postLDAPSTSForError(c *check, username, password string) ldapSTSErrorResult {
++	c.Helper()
++
++	ctx, cancel := context.WithTimeout(context.Background(), testDefaultTimeout)
++	defer cancel()
++
++	form := url.Values{}
++	form.Set("Action", ldapIdentity)
++	form.Set("Version", stsAPIVersion)
++	form.Set(stsLDAPUsername, username)
++	form.Set(stsLDAPPassword, password)
++
++	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.endPoint, strings.NewReader(form.Encode()))
++	if err != nil {
++		c.Fatalf("unexpected request creation error: %v", err)
++	}
++	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
++
++	resp, err := s.TestSuiteCommon.client.Do(req)
++	if err != nil {
++		c.Fatalf("unexpected LDAP STS request error: %v", err)
++	}
++	defer resp.Body.Close()
++
++	body, err := io.ReadAll(resp.Body)
++	if err != nil {
++		c.Fatalf("unexpected LDAP STS response read error: %v", err)
++	}
++	if resp.StatusCode == http.StatusOK {
++		c.Fatalf("expected LDAP STS request to fail, got success: %s", body)
++	}
++
++	var stsErr STSErrorResponse
++	if err = xml.Unmarshal(body, &stsErr); err != nil {
++		c.Fatalf("unexpected LDAP STS XML decode error: %v, body: %s", err, body)
++	}
++
++	return ldapSTSErrorResult{
++		StatusCode: resp.StatusCode,
++		RetryAfter: resp.Header.Get("Retry-After"),
++		Code:       stsErr.Error.Code,
++		Message:    stsErr.Error.Message,
++		Body:       string(body),
++	}
++}
++
++func (s *TestSuiteIAM) TestLDAPSTSAuthFailureUniformResponse(c *check) {
++	withGlobalSTSLDAPLoginRateLimiterForTest(
++		newSTSLDAPLoginRateLimiter(time.Minute, stsLDAPLoginBurst, stsLDAPLoginEntryTTL),
++		func() {
++			missingUser := s.postLDAPSTSForError(c, "missing-user", "nottherightpassword")
++			wrongPassword := s.postLDAPSTSForError(c, "dillon", "nottherightpassword")
++
++			if missingUser.StatusCode != http.StatusBadRequest {
++				c.Fatalf("expected missing-user request status %d, got %d", http.StatusBadRequest, missingUser.StatusCode)
++			}
++			if wrongPassword.StatusCode != http.StatusBadRequest {
++				c.Fatalf("expected wrong-password request status %d, got %d", http.StatusBadRequest, wrongPassword.StatusCode)
++			}
++			if missingUser.Code != "InvalidParameterValue" || wrongPassword.Code != "InvalidParameterValue" {
++				c.Fatalf("expected InvalidParameterValue for both auth failures, got missing=%q wrong=%q", missingUser.Code, wrongPassword.Code)
++			}
++			if missingUser.Message != errLDAPAuthenticationFailed.Error() || wrongPassword.Message != errLDAPAuthenticationFailed.Error() {
++				c.Fatalf("expected uniform LDAP auth failure message, got missing=%q wrong=%q", missingUser.Message, wrongPassword.Message)
++			}
++			if strings.Contains(strings.ToLower(missingUser.Body), "unable to find user dn") {
++				c.Fatalf("missing-user response leaked lookup details: %s", missingUser.Body)
++			}
++			if strings.Contains(strings.ToLower(wrongPassword.Body), "ldap auth failed for dn") {
++				c.Fatalf("wrong-password response leaked bind details: %s", wrongPassword.Body)
++			}
++		},
++	)
++}
++
++func (s *TestSuiteIAM) TestLDAPSTSRateLimit(c *check) {
++	withGlobalSTSLDAPLoginRateLimiterForTest(
++		newSTSLDAPLoginRateLimiter(time.Hour, 2, stsLDAPLoginEntryTTL),
++		func() {
++			first := s.postLDAPSTSForError(c, "dillon", "nottherightpassword")
++			second := s.postLDAPSTSForError(c, "dillon", "nottherightpassword")
++			throttled := s.postLDAPSTSForError(c, "dillon", "nottherightpassword")
++
++			if first.StatusCode != http.StatusBadRequest || second.StatusCode != http.StatusBadRequest {
++				c.Fatalf("expected first two failed auth attempts to return %d, got %d and %d", http.StatusBadRequest, first.StatusCode, second.StatusCode)
++			}
++			if throttled.StatusCode != http.StatusTooManyRequests {
++				c.Fatalf("expected throttled request status %d, got %d", http.StatusTooManyRequests, throttled.StatusCode)
++			}
++			if throttled.Code != "ThrottlingException" {
++				c.Fatalf("expected throttled code %q, got %q", "ThrottlingException", throttled.Code)
++			}
++			if throttled.Message != "Request throttled, please retry later." {
++				c.Fatalf("expected throttled message %q, got %q", "Request throttled, please retry later.", throttled.Message)
++			}
++			if throttled.RetryAfter != fmt.Sprintf("%d", stsLDAPLoginRetryAfterSec) {
++				c.Fatalf("expected Retry-After %d, got %q", stsLDAPLoginRetryAfterSec, throttled.RetryAfter)
++			}
++		},
++	)
++}
++
++func (s *TestSuiteIAM) TestLDAPSTSUpstreamFailure(c *check) {
++	original := globalIAMSys.LDAPConfig.Clone()
++	globalIAMSys.LDAPConfig.LDAP.ServerAddr = "127.0.0.1:1"
++	defer func() {
++		globalIAMSys.LDAPConfig = original
++	}()
++
++	withGlobalSTSLDAPLoginRateLimiterForTest(
++		newSTSLDAPLoginRateLimiter(time.Minute, stsLDAPLoginBurst, stsLDAPLoginEntryTTL),
++		func() {
++			upstreamFailure := s.postLDAPSTSForError(c, "dillon", "dillon")
++
++			if upstreamFailure.StatusCode != http.StatusInternalServerError {
++				c.Fatalf("expected upstream failure status %d, got %d", http.StatusInternalServerError, upstreamFailure.StatusCode)
++			}
++			if upstreamFailure.Code != "InternalError" {
++				c.Fatalf("expected upstream failure code %q, got %q", "InternalError", upstreamFailure.Code)
++			}
++			if upstreamFailure.Message != stsErrCodes.ToSTSErr(ErrSTSUpstreamError).Description {
++				c.Fatalf("expected upstream failure message %q, got %q", stsErrCodes.ToSTSErr(ErrSTSUpstreamError).Description, upstreamFailure.Message)
++			}
++			if upstreamFailure.Message == errLDAPAuthenticationFailed.Error() {
++				c.Fatalf("expected upstream failure to stay distinct from auth failure, got %q", upstreamFailure.Message)
++			}
++		},
++	)
++}
++
++func TestIAMWithLDAPSecurityServerSuite(t *testing.T) {
++	tests := []struct {
++		name string
++		run  func(*TestSuiteIAM, *check, string)
++	}{
++		{
++			name: "AuthFailureUniformResponse",
++			run: func(suite *TestSuiteIAM, c *check, ldapServer string) {
++				suite.TestLDAPSTSAuthFailureUniformResponse(c)
++			},
++		},
++		{
++			name: "RateLimit",
++			run: func(suite *TestSuiteIAM, c *check, ldapServer string) {
++				suite.TestLDAPSTSRateLimit(c)
++			},
++		},
++		{
++			name: "UpstreamFailure",
++			run: func(suite *TestSuiteIAM, c *check, ldapServer string) {
++				suite.TestLDAPSTSUpstreamFailure(c)
++			},
++		},
++	}
++
++	for i, testCase := range iamTestSuites {
++		t.Run(
++			fmt.Sprintf("Test: %d, ServerType: %s", i+1, testCase.ServerTypeDescription),
++			func(t *testing.T) {
++				ldapServer := os.Getenv(EnvTestLDAPServer)
++				if ldapServer == "" {
++					t.Skipf("Skipping LDAP security test as no LDAP server is provided via %s", EnvTestLDAPServer)
++				}
++
++				suite := testCase
++				for _, tc := range tests {
++					tc := tc
++					t.Run(tc.name, func(t *testing.T) {
++						c := &check{t, testCase.serverType}
++						suite.SetUpSuite(c)
++						suite.SetUpLDAP(c, ldapServer)
++						tc.run(suite, c, ldapServer)
++						suite.TearDownSuite(c)
++					})
++				}
++			},
++		)
++	}
++}
++
+ // This test is for a fix added to handle non-normalized base DN values in the
+ // LDAP configuration. It runs the existing LDAP sub-tests with a non-normalized
+ // LDAP configuration.
+@@ -1052,6 +1255,144 @@ func TestIAMExportImportWithLDAP(t *testing.T) {
+ 	}
+ }
+ 
++type matchingAuthError struct{}
++
++func (matchingAuthError) Error() string {
++	return "ldap auth failed"
++}
++
++func (matchingAuthError) Is(target error) bool {
++	return targetIsLDAPAuthFailure(target)
++}
++
++func targetIsLDAPAuthFailure(target error) bool {
++	return target != nil && target.Error() == "ldap authentication failed"
++}
++
++func TestSTSLDAPLoginRateLimiter(t *testing.T) {
++	limiter := newSTSLDAPLoginRateLimiter(time.Hour, 2, time.Minute)
++
++	if !limiter.Allow("192.0.2.10", "dillon") {
++		t.Fatal("expected first attempt to be allowed")
++	}
++	if !limiter.Allow("192.0.2.10", "kevin") {
++		t.Fatal("expected second source-IP attempt to be allowed")
++	}
++	if limiter.Allow("192.0.2.10", "stuart") {
++		t.Fatal("expected source IP bucket to be throttled")
++	}
++
++	limiter = newSTSLDAPLoginRateLimiter(time.Hour, 2, time.Minute)
++	if !limiter.Allow("192.0.2.10", "dillon") {
++		t.Fatal("expected first username attempt to be allowed")
++	}
++	if !limiter.Allow("192.0.2.11", "dillon") {
++		t.Fatal("expected second username attempt from a different source to be allowed")
++	}
++	if limiter.Allow("192.0.2.12", "dillon") {
++		t.Fatal("expected username bucket to be throttled")
++	}
++	if !limiter.Allow("192.0.2.12", "other-user") {
++		t.Fatal("expected a fresh username and source tuple to be allowed")
++	}
++}
++
++func TestLDAPBindErrorToSTS(t *testing.T) {
++	tests := []struct {
++		name    string
++		err     error
++		code    STSErrorCode
++		message string
++	}{
++		{
++			name:    "auth failure",
++			err:     matchingAuthError{},
++			code:    ErrSTSInvalidParameterValue,
++			message: errLDAPAuthenticationFailed.Error(),
++		},
++		{
++			name:    "upstream failure",
++			err:     errors.New("ldap server unavailable"),
++			code:    ErrSTSUpstreamError,
++			message: "",
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			code, err := ldapBindErrorToSTS(tt.err)
++			if code != tt.code {
++				t.Fatalf("expected code %v, got %v", tt.code, code)
++			}
++			if tt.message == "" {
++				if err != nil {
++					t.Fatalf("expected nil response error, got %v", err)
++				}
++				return
++			}
++			if err == nil || err.Error() != tt.message {
++				t.Fatalf("expected %q, got %v", tt.message, err)
++			}
++		})
++	}
++}
++
++func TestSTSLDAPLoginRateLimiterUsernameNormalization(t *testing.T) {
++	limiter := newSTSLDAPLoginRateLimiter(time.Hour, 2, time.Minute)
++
++	if !limiter.Allow("192.0.2.10", "Admin") {
++		t.Fatal("expected first username variant to be allowed")
++	}
++	if !limiter.Allow("192.0.2.11", " admin ") {
++		t.Fatal("expected trimmed lowercase-equivalent username to be allowed")
++	}
++	if limiter.Allow("192.0.2.12", "ADMIN") {
++		t.Fatal("expected username normalization to hit the same bucket")
++	}
++}
++
++func TestSTSLDAPLoginRateLimiterCleanup(t *testing.T) {
++	set := newSTSLDAPLoginKeyLimiterSet(time.Hour, 1, time.Minute)
++	start := time.Unix(0, 0)
++
++	if !set.Allow(start, "old-key") {
++		t.Fatal("expected initial key to be allowed")
++	}
++	if len(set.entries) != 1 {
++		t.Fatalf("expected one entry, got %d", len(set.entries))
++	}
++
++	if !set.Allow(start.Add(2*time.Minute), "new-key") {
++		t.Fatal("expected new key to be allowed after ttl expiry")
++	}
++	if _, ok := set.entries["old-key"]; ok {
++		t.Fatal("expected expired key to be cleaned up")
++	}
++}
++
++func TestWriteSTSThrottledResponse(t *testing.T) {
++	req := httptest.NewRequest(http.MethodPost, "http://minio.test", strings.NewReader(""))
++	rr := httptest.NewRecorder()
++	req = req.WithContext(newContext(req, rr, "test-throttle"))
++
++	writeSTSThrottledResponse(rr)
++
++	if rr.Code != http.StatusTooManyRequests {
++		t.Fatalf("expected status %d, got %d", http.StatusTooManyRequests, rr.Code)
++	}
++	if got := rr.Header().Get("Retry-After"); got != "6" {
++		t.Fatalf("expected Retry-After header %q, got %q", "6", got)
++	}
++
++	body := rr.Body.String()
++	if !strings.Contains(body, "<Code>ThrottlingException</Code>") {
++		t.Fatalf("expected throttling code in response, got %s", body)
++	}
++	if !strings.Contains(body, "<Message>Request throttled, please retry later.</Message>") {
++		t.Fatalf("expected throttling message in response, got %s", body)
++	}
++}
++
+ func TestIAMImportAssetWithLDAP(t *testing.T) {
+ 	ctx, cancel := context.WithTimeout(t.Context(), testDefaultTimeout)
+ 	defer cancel()
+diff --git a/internal/config/identity/ldap/ldap.go b/internal/config/identity/ldap/ldap.go
+index 1c1c704c38e01..967b6d78cde16 100644
+--- a/internal/config/identity/ldap/ldap.go
++++ b/internal/config/identity/ldap/ldap.go
+@@ -30,6 +30,42 @@ import (
+ 	xldap "github.com/minio/pkg/v3/ldap"
+ )
+ 
++var errAuthentication = errors.New("ldap authentication failed")
++
++func isUserDNNotFoundError(err error) bool {
++	return err != nil && strings.Contains(strings.ToLower(err.Error()), "user dn not found for")
++}
++
++// authError marks authentication failures without changing the returned
++// message, so callers can distinguish auth failures from upstream outages.
++type authError struct {
++	err error
++}
++
++func (e authError) Error() string {
++	return e.err.Error()
++}
++
++func (e authError) Unwrap() error {
++	return e.err
++}
++
++func (e authError) Is(target error) bool {
++	return target == errAuthentication
++}
++
++func wrapAuthError(err error) error {
++	if err == nil {
++		return nil
++	}
++	return authError{err: err}
++}
++
++// IsAuthError reports whether err is an LDAP authentication failure.
++func IsAuthError(err error) bool {
++	return errors.Is(err, errAuthentication)
++}
++
+ // LookupUserDN searches for the full DN and groups of a given short/login
+ // username.
+ func (l *Config) LookupUserDN(username string) (*xldap.DNSearchResult, []string, error) {
+@@ -86,7 +122,7 @@ func (l *Config) GetValidatedDNForUsername(username string) (*xldap.DNSearchResu
+ 		// the directory.
+ 		bindDN, err := l.LDAP.LookupUsername(conn, username)
+ 		if err != nil {
+-			if strings.Contains(err.Error(), "User DN not found for") {
++			if isUserDNNotFoundError(err) {
+ 				return nil, nil
+ 			}
+ 			return nil, fmt.Errorf("Unable to find user DN: %w", err)
+@@ -204,7 +240,7 @@ func (l *Config) GetValidatedDNWithGroups(username string) (*xldap.DNSearchResul
+ 		// the directory.
+ 		lookupRes, err = l.LDAP.LookupUsername(conn, username)
+ 		if err != nil {
+-			if strings.Contains(err.Error(), "User DN not found for") {
++			if isUserDNNotFoundError(err) {
+ 				return nil, nil, nil
+ 			}
+ 			return nil, nil, fmt.Errorf("Unable to find user DN: %w", err)
+@@ -245,6 +281,9 @@ func (l *Config) Bind(username, password string) (*xldap.DNSearchResult, []strin
+ 	lookupResult, err := l.LDAP.LookupUsername(conn, username)
+ 	if err != nil {
+ 		errRet := fmt.Errorf("Unable to find user DN: %w", err)
++		if isUserDNNotFoundError(err) {
++			return nil, nil, wrapAuthError(errRet)
++		}
+ 		return nil, nil, errRet
+ 	}
+ 
+@@ -252,7 +291,7 @@ func (l *Config) Bind(username, password string) (*xldap.DNSearchResult, []strin
+ 	err = conn.Bind(lookupResult.ActualDN, password)
+ 	if err != nil {
+ 		errRet := fmt.Errorf("LDAP auth failed for DN %s: %w", lookupResult.ActualDN, err)
+-		return nil, nil, errRet
++		return nil, nil, wrapAuthError(errRet)
+ 	}
+ 
+ 	// Bind to the lookup user account again to perform group search.
+diff --git a/internal/config/identity/ldap/ldap_test.go b/internal/config/identity/ldap/ldap_test.go
+new file mode 100644
+index 0000000000000..ea646afc25518
+--- /dev/null
++++ b/internal/config/identity/ldap/ldap_test.go
+@@ -0,0 +1,45 @@
++package ldap
++
++import (
++	"errors"
++	"testing"
++)
++
++func TestWrapAuthError(t *testing.T) {
++	baseErr := errors.New("LDAP auth failed for DN uid=dillon,dc=min,dc=io")
++	err := wrapAuthError(baseErr)
++
++	if !IsAuthError(err) {
++		t.Fatal("expected wrapped error to be recognized as auth failure")
++	}
++	if err.Error() != baseErr.Error() {
++		t.Fatalf("expected error text %q, got %q", baseErr.Error(), err.Error())
++	}
++}
++
++func TestWrapAuthErrorNil(t *testing.T) {
++	if wrapAuthError(nil) != nil {
++		t.Fatal("expected nil input to stay nil")
++	}
++}
++
++func TestIsAuthErrorNegative(t *testing.T) {
++	if IsAuthError(errors.New("ldap unavailable")) {
++		t.Fatal("expected plain errors to not be classified as auth failures")
++	}
++}
++
++func TestIsUserDNNotFoundError(t *testing.T) {
++	if isUserDNNotFoundError(nil) {
++		t.Fatal("expected nil error to not be detected as user-not-found")
++	}
++	if !isUserDNNotFoundError(errors.New("user DN not found for: dillon")) {
++		t.Fatal("expected lowercase user-not-found error to be detected")
++	}
++	if !isUserDNNotFoundError(errors.New("User DN not found for: dillon")) {
++		t.Fatal("expected legacy uppercase user-not-found error to be detected")
++	}
++	if isUserDNNotFoundError(errors.New("base DN (dc=min,dc=io) for user DN search does not exist")) {
++		t.Fatal("expected infrastructure lookup error to not be detected as user-not-found")
++	}
++}

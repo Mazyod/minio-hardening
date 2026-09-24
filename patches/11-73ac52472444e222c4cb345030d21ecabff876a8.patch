@@ -1,0 +1,1294 @@
+From 73ac52472444e222c4cb345030d21ecabff876a8 Mon Sep 17 00:00:00 2001
+From: Feng Ruohang <rh@vonng.com>
+Date: Fri, 12 Jun 2026 18:55:15 +0800
+Subject: [PATCH] fix: CVE-2026-42600 remove ReadMultiple storage-REST API
+
+The internode storage-REST ReadMultiple endpoint (/rmpl) joined
+attacker-controlled Bucket/Prefix/Files into a filesystem path with no
+validation, letting a peer with internode credentials read files outside
+the drive root (GHSA-xh8f-g2qw-gcm7).
+
+ReadMultiple has had no production caller since upstream #20390 removed
+the last one (listParts) in Sep 2024; multipart now uses ReadParts (/rps).
+Following the upstream fix, remove the whole API instead of validating
+paths: route constant and registration, server handler, REST client
+wrapper, the StorageAPI/xlStorage/xlStorageDiskIDCheck methods, the
+storageMetricReadMultiple metric, and the ReadMultipleReq/Resp datatypes.
+Regenerated the msgp and stringer outputs; storageRESTVersion stays at v63.
+
+Co-authored-by: Codex <codex@openai.com>
+Co-authored-by: Claude Code <claude-code@anthropic.com>
+---
+ cmd/naughty-disk_test.go          |   8 -
+ cmd/storage-datatypes.go          |  22 -
+ cmd/storage-datatypes_gen.go      | 666 ------------------------------
+ cmd/storage-datatypes_gen_test.go | 226 ----------
+ cmd/storage-interface.go          |   1 -
+ cmd/storage-rest-client.go        |  39 --
+ cmd/storage-rest-common.go        |   1 -
+ cmd/storage-rest-server.go        |  44 --
+ cmd/storagemetric_string.go       |  17 +-
+ cmd/xl-storage-disk-id-check.go   |  16 -
+ cmd/xl-storage.go                 |  75 ----
+ 11 files changed, 8 insertions(+), 1107 deletions(-)
+
+diff --git a/cmd/naughty-disk_test.go b/cmd/naughty-disk_test.go
+index 3316225341a93..ab507dbeed68d 100644
+--- a/cmd/naughty-disk_test.go
++++ b/cmd/naughty-disk_test.go
+@@ -324,14 +324,6 @@ func (d *naughtyDisk) StatInfoFile(ctx context.Context, volume, path string, glo
+ 	return d.disk.StatInfoFile(ctx, volume, path, glob)
+ }
+ 
+-func (d *naughtyDisk) ReadMultiple(ctx context.Context, req ReadMultipleReq, resp chan<- ReadMultipleResp) error {
+-	if err := d.calcError(); err != nil {
+-		close(resp)
+-		return err
+-	}
+-	return d.disk.ReadMultiple(ctx, req, resp)
+-}
+-
+ func (d *naughtyDisk) CleanAbandonedData(ctx context.Context, volume string, path string) error {
+ 	if err := d.calcError(); err != nil {
+ 		return err
+diff --git a/cmd/storage-datatypes.go b/cmd/storage-datatypes.go
+index be36fa3595425..4855c4c002de5 100644
+--- a/cmd/storage-datatypes.go
++++ b/cmd/storage-datatypes.go
+@@ -396,28 +396,6 @@ func newFileInfo(object string, dataBlocks, parityBlocks int) (fi FileInfo) {
+ 	return fi
+ }
+ 
+-// ReadMultipleReq contains information of multiple files to read from disk.
+-type ReadMultipleReq struct {
+-	Bucket       string   `msg:"bk"`           // Bucket. Can be empty if multiple buckets.
+-	Prefix       string   `msg:"pr,omitempty"` // Shared prefix of all files. Can be empty. Will be joined to filename without modification.
+-	Files        []string `msg:"fl"`           // Individual files to read.
+-	MaxSize      int64    `msg:"ms"`           // Return error if size is exceed.
+-	MetadataOnly bool     `msg:"mo"`           // Read as XL meta and truncate data.
+-	AbortOn404   bool     `msg:"ab"`           // Stop reading after first file not found.
+-	MaxResults   int      `msg:"mr"`           // Stop after this many successful results. <= 0 means all.
+-}
+-
+-// ReadMultipleResp contains a single response from a ReadMultipleReq.
+-type ReadMultipleResp struct {
+-	Bucket  string    `msg:"bk"`           // Bucket as given by request.
+-	Prefix  string    `msg:"pr,omitempty"` // Prefix as given by request.
+-	File    string    `msg:"fl"`           // File name as given in request.
+-	Exists  bool      `msg:"ex"`           // Returns whether the file existed on disk.
+-	Error   string    `msg:"er,omitempty"` // Returns any error when reading.
+-	Data    []byte    `msg:"d"`            // Contains all data of file.
+-	Modtime time.Time `msg:"m"`            // Modtime of file on disk.
+-}
+-
+ // DeleteVersionHandlerParams are parameters for DeleteVersionHandler
+ type DeleteVersionHandlerParams struct {
+ 	DiskID         string        `msg:"id"`
+diff --git a/cmd/storage-datatypes_gen.go b/cmd/storage-datatypes_gen.go
+index 3671bb2e9d850..1a4f868518f16 100644
+--- a/cmd/storage-datatypes_gen.go
++++ b/cmd/storage-datatypes_gen.go
+@@ -4234,672 +4234,6 @@ func (z ReadAllHandlerParams) Msgsize() (s int) {
+ 	return
+ }
+ 
+-// DecodeMsg implements msgp.Decodable
+-func (z *ReadMultipleReq) DecodeMsg(dc *msgp.Reader) (err error) {
+-	var field []byte
+-	_ = field
+-	var zb0001 uint32
+-	zb0001, err = dc.ReadMapHeader()
+-	if err != nil {
+-		err = msgp.WrapError(err)
+-		return
+-	}
+-	var zb0001Mask uint8 /* 1 bits */
+-	_ = zb0001Mask
+-	for zb0001 > 0 {
+-		zb0001--
+-		field, err = dc.ReadMapKeyPtr()
+-		if err != nil {
+-			err = msgp.WrapError(err)
+-			return
+-		}
+-		switch msgp.UnsafeString(field) {
+-		case "bk":
+-			z.Bucket, err = dc.ReadString()
+-			if err != nil {
+-				err = msgp.WrapError(err, "Bucket")
+-				return
+-			}
+-		case "pr":
+-			z.Prefix, err = dc.ReadString()
+-			if err != nil {
+-				err = msgp.WrapError(err, "Prefix")
+-				return
+-			}
+-			zb0001Mask |= 0x1
+-		case "fl":
+-			var zb0002 uint32
+-			zb0002, err = dc.ReadArrayHeader()
+-			if err != nil {
+-				err = msgp.WrapError(err, "Files")
+-				return
+-			}
+-			if cap(z.Files) >= int(zb0002) {
+-				z.Files = (z.Files)[:zb0002]
+-			} else {
+-				z.Files = make([]string, zb0002)
+-			}
+-			for za0001 := range z.Files {
+-				z.Files[za0001], err = dc.ReadString()
+-				if err != nil {
+-					err = msgp.WrapError(err, "Files", za0001)
+-					return
+-				}
+-			}
+-		case "ms":
+-			z.MaxSize, err = dc.ReadInt64()
+-			if err != nil {
+-				err = msgp.WrapError(err, "MaxSize")
+-				return
+-			}
+-		case "mo":
+-			z.MetadataOnly, err = dc.ReadBool()
+-			if err != nil {
+-				err = msgp.WrapError(err, "MetadataOnly")
+-				return
+-			}
+-		case "ab":
+-			z.AbortOn404, err = dc.ReadBool()
+-			if err != nil {
+-				err = msgp.WrapError(err, "AbortOn404")
+-				return
+-			}
+-		case "mr":
+-			z.MaxResults, err = dc.ReadInt()
+-			if err != nil {
+-				err = msgp.WrapError(err, "MaxResults")
+-				return
+-			}
+-		default:
+-			err = dc.Skip()
+-			if err != nil {
+-				err = msgp.WrapError(err)
+-				return
+-			}
+-		}
+-	}
+-	// Clear omitted fields.
+-	if (zb0001Mask & 0x1) == 0 {
+-		z.Prefix = ""
+-	}
+-
+-	return
+-}
+-
+-// EncodeMsg implements msgp.Encodable
+-func (z *ReadMultipleReq) EncodeMsg(en *msgp.Writer) (err error) {
+-	// check for omitted fields
+-	zb0001Len := uint32(7)
+-	var zb0001Mask uint8 /* 7 bits */
+-	_ = zb0001Mask
+-	if z.Prefix == "" {
+-		zb0001Len--
+-		zb0001Mask |= 0x2
+-	}
+-	// variable map header, size zb0001Len
+-	err = en.Append(0x80 | uint8(zb0001Len))
+-	if err != nil {
+-		return
+-	}
+-
+-	// skip if no fields are to be emitted
+-	if zb0001Len != 0 {
+-		// write "bk"
+-		err = en.Append(0xa2, 0x62, 0x6b)
+-		if err != nil {
+-			return
+-		}
+-		err = en.WriteString(z.Bucket)
+-		if err != nil {
+-			err = msgp.WrapError(err, "Bucket")
+-			return
+-		}
+-		if (zb0001Mask & 0x2) == 0 { // if not omitted
+-			// write "pr"
+-			err = en.Append(0xa2, 0x70, 0x72)
+-			if err != nil {
+-				return
+-			}
+-			err = en.WriteString(z.Prefix)
+-			if err != nil {
+-				err = msgp.WrapError(err, "Prefix")
+-				return
+-			}
+-		}
+-		// write "fl"
+-		err = en.Append(0xa2, 0x66, 0x6c)
+-		if err != nil {
+-			return
+-		}
+-		err = en.WriteArrayHeader(uint32(len(z.Files)))
+-		if err != nil {
+-			err = msgp.WrapError(err, "Files")
+-			return
+-		}
+-		for za0001 := range z.Files {
+-			err = en.WriteString(z.Files[za0001])
+-			if err != nil {
+-				err = msgp.WrapError(err, "Files", za0001)
+-				return
+-			}
+-		}
+-		// write "ms"
+-		err = en.Append(0xa2, 0x6d, 0x73)
+-		if err != nil {
+-			return
+-		}
+-		err = en.WriteInt64(z.MaxSize)
+-		if err != nil {
+-			err = msgp.WrapError(err, "MaxSize")
+-			return
+-		}
+-		// write "mo"
+-		err = en.Append(0xa2, 0x6d, 0x6f)
+-		if err != nil {
+-			return
+-		}
+-		err = en.WriteBool(z.MetadataOnly)
+-		if err != nil {
+-			err = msgp.WrapError(err, "MetadataOnly")
+-			return
+-		}
+-		// write "ab"
+-		err = en.Append(0xa2, 0x61, 0x62)
+-		if err != nil {
+-			return
+-		}
+-		err = en.WriteBool(z.AbortOn404)
+-		if err != nil {
+-			err = msgp.WrapError(err, "AbortOn404")
+-			return
+-		}
+-		// write "mr"
+-		err = en.Append(0xa2, 0x6d, 0x72)
+-		if err != nil {
+-			return
+-		}
+-		err = en.WriteInt(z.MaxResults)
+-		if err != nil {
+-			err = msgp.WrapError(err, "MaxResults")
+-			return
+-		}
+-	}
+-	return
+-}
+-
+-// MarshalMsg implements msgp.Marshaler
+-func (z *ReadMultipleReq) MarshalMsg(b []byte) (o []byte, err error) {
+-	o = msgp.Require(b, z.Msgsize())
+-	// check for omitted fields
+-	zb0001Len := uint32(7)
+-	var zb0001Mask uint8 /* 7 bits */
+-	_ = zb0001Mask
+-	if z.Prefix == "" {
+-		zb0001Len--
+-		zb0001Mask |= 0x2
+-	}
+-	// variable map header, size zb0001Len
+-	o = append(o, 0x80|uint8(zb0001Len))
+-
+-	// skip if no fields are to be emitted
+-	if zb0001Len != 0 {
+-		// string "bk"
+-		o = append(o, 0xa2, 0x62, 0x6b)
+-		o = msgp.AppendString(o, z.Bucket)
+-		if (zb0001Mask & 0x2) == 0 { // if not omitted
+-			// string "pr"
+-			o = append(o, 0xa2, 0x70, 0x72)
+-			o = msgp.AppendString(o, z.Prefix)
+-		}
+-		// string "fl"
+-		o = append(o, 0xa2, 0x66, 0x6c)
+-		o = msgp.AppendArrayHeader(o, uint32(len(z.Files)))
+-		for za0001 := range z.Files {
+-			o = msgp.AppendString(o, z.Files[za0001])
+-		}
+-		// string "ms"
+-		o = append(o, 0xa2, 0x6d, 0x73)
+-		o = msgp.AppendInt64(o, z.MaxSize)
+-		// string "mo"
+-		o = append(o, 0xa2, 0x6d, 0x6f)
+-		o = msgp.AppendBool(o, z.MetadataOnly)
+-		// string "ab"
+-		o = append(o, 0xa2, 0x61, 0x62)
+-		o = msgp.AppendBool(o, z.AbortOn404)
+-		// string "mr"
+-		o = append(o, 0xa2, 0x6d, 0x72)
+-		o = msgp.AppendInt(o, z.MaxResults)
+-	}
+-	return
+-}
+-
+-// UnmarshalMsg implements msgp.Unmarshaler
+-func (z *ReadMultipleReq) UnmarshalMsg(bts []byte) (o []byte, err error) {
+-	var field []byte
+-	_ = field
+-	var zb0001 uint32
+-	zb0001, bts, err = msgp.ReadMapHeaderBytes(bts)
+-	if err != nil {
+-		err = msgp.WrapError(err)
+-		return
+-	}
+-	var zb0001Mask uint8 /* 1 bits */
+-	_ = zb0001Mask
+-	for zb0001 > 0 {
+-		zb0001--
+-		field, bts, err = msgp.ReadMapKeyZC(bts)
+-		if err != nil {
+-			err = msgp.WrapError(err)
+-			return
+-		}
+-		switch msgp.UnsafeString(field) {
+-		case "bk":
+-			z.Bucket, bts, err = msgp.ReadStringBytes(bts)
+-			if err != nil {
+-				err = msgp.WrapError(err, "Bucket")
+-				return
+-			}
+-		case "pr":
+-			z.Prefix, bts, err = msgp.ReadStringBytes(bts)
+-			if err != nil {
+-				err = msgp.WrapError(err, "Prefix")
+-				return
+-			}
+-			zb0001Mask |= 0x1
+-		case "fl":
+-			var zb0002 uint32
+-			zb0002, bts, err = msgp.ReadArrayHeaderBytes(bts)
+-			if err != nil {
+-				err = msgp.WrapError(err, "Files")
+-				return
+-			}
+-			if cap(z.Files) >= int(zb0002) {
+-				z.Files = (z.Files)[:zb0002]
+-			} else {
+-				z.Files = make([]string, zb0002)
+-			}
+-			for za0001 := range z.Files {
+-				z.Files[za0001], bts, err = msgp.ReadStringBytes(bts)
+-				if err != nil {
+-					err = msgp.WrapError(err, "Files", za0001)
+-					return
+-				}
+-			}
+-		case "ms":
+-			z.MaxSize, bts, err = msgp.ReadInt64Bytes(bts)
+-			if err != nil {
+-				err = msgp.WrapError(err, "MaxSize")
+-				return
+-			}
+-		case "mo":
+-			z.MetadataOnly, bts, err = msgp.ReadBoolBytes(bts)
+-			if err != nil {
+-				err = msgp.WrapError(err, "MetadataOnly")
+-				return
+-			}
+-		case "ab":
+-			z.AbortOn404, bts, err = msgp.ReadBoolBytes(bts)
+-			if err != nil {
+-				err = msgp.WrapError(err, "AbortOn404")
+-				return
+-			}
+-		case "mr":
+-			z.MaxResults, bts, err = msgp.ReadIntBytes(bts)
+-			if err != nil {
+-				err = msgp.WrapError(err, "MaxResults")
+-				return
+-			}
+-		default:
+-			bts, err = msgp.Skip(bts)
+-			if err != nil {
+-				err = msgp.WrapError(err)
+-				return
+-			}
+-		}
+-	}
+-	// Clear omitted fields.
+-	if (zb0001Mask & 0x1) == 0 {
+-		z.Prefix = ""
+-	}
+-
+-	o = bts
+-	return
+-}
+-
+-// Msgsize returns an upper bound estimate of the number of bytes occupied by the serialized message
+-func (z *ReadMultipleReq) Msgsize() (s int) {
+-	s = 1 + 3 + msgp.StringPrefixSize + len(z.Bucket) + 3 + msgp.StringPrefixSize + len(z.Prefix) + 3 + msgp.ArrayHeaderSize
+-	for za0001 := range z.Files {
+-		s += msgp.StringPrefixSize + len(z.Files[za0001])
+-	}
+-	s += 3 + msgp.Int64Size + 3 + msgp.BoolSize + 3 + msgp.BoolSize + 3 + msgp.IntSize
+-	return
+-}
+-
+-// DecodeMsg implements msgp.Decodable
+-func (z *ReadMultipleResp) DecodeMsg(dc *msgp.Reader) (err error) {
+-	var field []byte
+-	_ = field
+-	var zb0001 uint32
+-	zb0001, err = dc.ReadMapHeader()
+-	if err != nil {
+-		err = msgp.WrapError(err)
+-		return
+-	}
+-	var zb0001Mask uint8 /* 2 bits */
+-	_ = zb0001Mask
+-	for zb0001 > 0 {
+-		zb0001--
+-		field, err = dc.ReadMapKeyPtr()
+-		if err != nil {
+-			err = msgp.WrapError(err)
+-			return
+-		}
+-		switch msgp.UnsafeString(field) {
+-		case "bk":
+-			z.Bucket, err = dc.ReadString()
+-			if err != nil {
+-				err = msgp.WrapError(err, "Bucket")
+-				return
+-			}
+-		case "pr":
+-			z.Prefix, err = dc.ReadString()
+-			if err != nil {
+-				err = msgp.WrapError(err, "Prefix")
+-				return
+-			}
+-			zb0001Mask |= 0x1
+-		case "fl":
+-			z.File, err = dc.ReadString()
+-			if err != nil {
+-				err = msgp.WrapError(err, "File")
+-				return
+-			}
+-		case "ex":
+-			z.Exists, err = dc.ReadBool()
+-			if err != nil {
+-				err = msgp.WrapError(err, "Exists")
+-				return
+-			}
+-		case "er":
+-			z.Error, err = dc.ReadString()
+-			if err != nil {
+-				err = msgp.WrapError(err, "Error")
+-				return
+-			}
+-			zb0001Mask |= 0x2
+-		case "d":
+-			z.Data, err = dc.ReadBytes(z.Data)
+-			if err != nil {
+-				err = msgp.WrapError(err, "Data")
+-				return
+-			}
+-		case "m":
+-			z.Modtime, err = dc.ReadTime()
+-			if err != nil {
+-				err = msgp.WrapError(err, "Modtime")
+-				return
+-			}
+-		default:
+-			err = dc.Skip()
+-			if err != nil {
+-				err = msgp.WrapError(err)
+-				return
+-			}
+-		}
+-	}
+-	// Clear omitted fields.
+-	if zb0001Mask != 0x3 {
+-		if (zb0001Mask & 0x1) == 0 {
+-			z.Prefix = ""
+-		}
+-		if (zb0001Mask & 0x2) == 0 {
+-			z.Error = ""
+-		}
+-	}
+-	return
+-}
+-
+-// EncodeMsg implements msgp.Encodable
+-func (z *ReadMultipleResp) EncodeMsg(en *msgp.Writer) (err error) {
+-	// check for omitted fields
+-	zb0001Len := uint32(7)
+-	var zb0001Mask uint8 /* 7 bits */
+-	_ = zb0001Mask
+-	if z.Prefix == "" {
+-		zb0001Len--
+-		zb0001Mask |= 0x2
+-	}
+-	if z.Error == "" {
+-		zb0001Len--
+-		zb0001Mask |= 0x10
+-	}
+-	// variable map header, size zb0001Len
+-	err = en.Append(0x80 | uint8(zb0001Len))
+-	if err != nil {
+-		return
+-	}
+-
+-	// skip if no fields are to be emitted
+-	if zb0001Len != 0 {
+-		// write "bk"
+-		err = en.Append(0xa2, 0x62, 0x6b)
+-		if err != nil {
+-			return
+-		}
+-		err = en.WriteString(z.Bucket)
+-		if err != nil {
+-			err = msgp.WrapError(err, "Bucket")
+-			return
+-		}
+-		if (zb0001Mask & 0x2) == 0 { // if not omitted
+-			// write "pr"
+-			err = en.Append(0xa2, 0x70, 0x72)
+-			if err != nil {
+-				return
+-			}
+-			err = en.WriteString(z.Prefix)
+-			if err != nil {
+-				err = msgp.WrapError(err, "Prefix")
+-				return
+-			}
+-		}
+-		// write "fl"
+-		err = en.Append(0xa2, 0x66, 0x6c)
+-		if err != nil {
+-			return
+-		}
+-		err = en.WriteString(z.File)
+-		if err != nil {
+-			err = msgp.WrapError(err, "File")
+-			return
+-		}
+-		// write "ex"
+-		err = en.Append(0xa2, 0x65, 0x78)
+-		if err != nil {
+-			return
+-		}
+-		err = en.WriteBool(z.Exists)
+-		if err != nil {
+-			err = msgp.WrapError(err, "Exists")
+-			return
+-		}
+-		if (zb0001Mask & 0x10) == 0 { // if not omitted
+-			// write "er"
+-			err = en.Append(0xa2, 0x65, 0x72)
+-			if err != nil {
+-				return
+-			}
+-			err = en.WriteString(z.Error)
+-			if err != nil {
+-				err = msgp.WrapError(err, "Error")
+-				return
+-			}
+-		}
+-		// write "d"
+-		err = en.Append(0xa1, 0x64)
+-		if err != nil {
+-			return
+-		}
+-		err = en.WriteBytes(z.Data)
+-		if err != nil {
+-			err = msgp.WrapError(err, "Data")
+-			return
+-		}
+-		// write "m"
+-		err = en.Append(0xa1, 0x6d)
+-		if err != nil {
+-			return
+-		}
+-		err = en.WriteTime(z.Modtime)
+-		if err != nil {
+-			err = msgp.WrapError(err, "Modtime")
+-			return
+-		}
+-	}
+-	return
+-}
+-
+-// MarshalMsg implements msgp.Marshaler
+-func (z *ReadMultipleResp) MarshalMsg(b []byte) (o []byte, err error) {
+-	o = msgp.Require(b, z.Msgsize())
+-	// check for omitted fields
+-	zb0001Len := uint32(7)
+-	var zb0001Mask uint8 /* 7 bits */
+-	_ = zb0001Mask
+-	if z.Prefix == "" {
+-		zb0001Len--
+-		zb0001Mask |= 0x2
+-	}
+-	if z.Error == "" {
+-		zb0001Len--
+-		zb0001Mask |= 0x10
+-	}
+-	// variable map header, size zb0001Len
+-	o = append(o, 0x80|uint8(zb0001Len))
+-
+-	// skip if no fields are to be emitted
+-	if zb0001Len != 0 {
+-		// string "bk"
+-		o = append(o, 0xa2, 0x62, 0x6b)
+-		o = msgp.AppendString(o, z.Bucket)
+-		if (zb0001Mask & 0x2) == 0 { // if not omitted
+-			// string "pr"
+-			o = append(o, 0xa2, 0x70, 0x72)
+-			o = msgp.AppendString(o, z.Prefix)
+-		}
+-		// string "fl"
+-		o = append(o, 0xa2, 0x66, 0x6c)
+-		o = msgp.AppendString(o, z.File)
+-		// string "ex"
+-		o = append(o, 0xa2, 0x65, 0x78)
+-		o = msgp.AppendBool(o, z.Exists)
+-		if (zb0001Mask & 0x10) == 0 { // if not omitted
+-			// string "er"
+-			o = append(o, 0xa2, 0x65, 0x72)
+-			o = msgp.AppendString(o, z.Error)
+-		}
+-		// string "d"
+-		o = append(o, 0xa1, 0x64)
+-		o = msgp.AppendBytes(o, z.Data)
+-		// string "m"
+-		o = append(o, 0xa1, 0x6d)
+-		o = msgp.AppendTime(o, z.Modtime)
+-	}
+-	return
+-}
+-
+-// UnmarshalMsg implements msgp.Unmarshaler
+-func (z *ReadMultipleResp) UnmarshalMsg(bts []byte) (o []byte, err error) {
+-	var field []byte
+-	_ = field
+-	var zb0001 uint32
+-	zb0001, bts, err = msgp.ReadMapHeaderBytes(bts)
+-	if err != nil {
+-		err = msgp.WrapError(err)
+-		return
+-	}
+-	var zb0001Mask uint8 /* 2 bits */
+-	_ = zb0001Mask
+-	for zb0001 > 0 {
+-		zb0001--
+-		field, bts, err = msgp.ReadMapKeyZC(bts)
+-		if err != nil {
+-			err = msgp.WrapError(err)
+-			return
+-		}
+-		switch msgp.UnsafeString(field) {
+-		case "bk":
+-			z.Bucket, bts, err = msgp.ReadStringBytes(bts)
+-			if err != nil {
+-				err = msgp.WrapError(err, "Bucket")
+-				return
+-			}
+-		case "pr":
+-			z.Prefix, bts, err = msgp.ReadStringBytes(bts)
+-			if err != nil {
+-				err = msgp.WrapError(err, "Prefix")
+-				return
+-			}
+-			zb0001Mask |= 0x1
+-		case "fl":
+-			z.File, bts, err = msgp.ReadStringBytes(bts)
+-			if err != nil {
+-				err = msgp.WrapError(err, "File")
+-				return
+-			}
+-		case "ex":
+-			z.Exists, bts, err = msgp.ReadBoolBytes(bts)
+-			if err != nil {
+-				err = msgp.WrapError(err, "Exists")
+-				return
+-			}
+-		case "er":
+-			z.Error, bts, err = msgp.ReadStringBytes(bts)
+-			if err != nil {
+-				err = msgp.WrapError(err, "Error")
+-				return
+-			}
+-			zb0001Mask |= 0x2
+-		case "d":
+-			z.Data, bts, err = msgp.ReadBytesBytes(bts, z.Data)
+-			if err != nil {
+-				err = msgp.WrapError(err, "Data")
+-				return
+-			}
+-		case "m":
+-			z.Modtime, bts, err = msgp.ReadTimeBytes(bts)
+-			if err != nil {
+-				err = msgp.WrapError(err, "Modtime")
+-				return
+-			}
+-		default:
+-			bts, err = msgp.Skip(bts)
+-			if err != nil {
+-				err = msgp.WrapError(err)
+-				return
+-			}
+-		}
+-	}
+-	// Clear omitted fields.
+-	if zb0001Mask != 0x3 {
+-		if (zb0001Mask & 0x1) == 0 {
+-			z.Prefix = ""
+-		}
+-		if (zb0001Mask & 0x2) == 0 {
+-			z.Error = ""
+-		}
+-	}
+-	o = bts
+-	return
+-}
+-
+-// Msgsize returns an upper bound estimate of the number of bytes occupied by the serialized message
+-func (z *ReadMultipleResp) Msgsize() (s int) {
+-	s = 1 + 3 + msgp.StringPrefixSize + len(z.Bucket) + 3 + msgp.StringPrefixSize + len(z.Prefix) + 3 + msgp.StringPrefixSize + len(z.File) + 3 + msgp.BoolSize + 3 + msgp.StringPrefixSize + len(z.Error) + 2 + msgp.BytesPrefixSize + len(z.Data) + 2 + msgp.TimeSize
+-	return
+-}
+-
+ // DecodeMsg implements msgp.Decodable
+ func (z *ReadPartsReq) DecodeMsg(dc *msgp.Reader) (err error) {
+ 	var field []byte
+diff --git a/cmd/storage-datatypes_gen_test.go b/cmd/storage-datatypes_gen_test.go
+index 78f53f36f6d83..9ea2c01fa7033 100644
+--- a/cmd/storage-datatypes_gen_test.go
++++ b/cmd/storage-datatypes_gen_test.go
+@@ -2156,232 +2156,6 @@ func BenchmarkDecodeReadAllHandlerParams(b *testing.B) {
+ 	}
+ }
+ 
+-func TestMarshalUnmarshalReadMultipleReq(t *testing.T) {
+-	v := ReadMultipleReq{}
+-	bts, err := v.MarshalMsg(nil)
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-	left, err := v.UnmarshalMsg(bts)
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-	if len(left) > 0 {
+-		t.Errorf("%d bytes left over after UnmarshalMsg(): %q", len(left), left)
+-	}
+-
+-	left, err = msgp.Skip(bts)
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-	if len(left) > 0 {
+-		t.Errorf("%d bytes left over after Skip(): %q", len(left), left)
+-	}
+-}
+-
+-func BenchmarkMarshalMsgReadMultipleReq(b *testing.B) {
+-	v := ReadMultipleReq{}
+-	b.ReportAllocs()
+-	b.ResetTimer()
+-	for i := 0; i < b.N; i++ {
+-		v.MarshalMsg(nil)
+-	}
+-}
+-
+-func BenchmarkAppendMsgReadMultipleReq(b *testing.B) {
+-	v := ReadMultipleReq{}
+-	bts := make([]byte, 0, v.Msgsize())
+-	bts, _ = v.MarshalMsg(bts[0:0])
+-	b.SetBytes(int64(len(bts)))
+-	b.ReportAllocs()
+-	b.ResetTimer()
+-	for i := 0; i < b.N; i++ {
+-		bts, _ = v.MarshalMsg(bts[0:0])
+-	}
+-}
+-
+-func BenchmarkUnmarshalReadMultipleReq(b *testing.B) {
+-	v := ReadMultipleReq{}
+-	bts, _ := v.MarshalMsg(nil)
+-	b.ReportAllocs()
+-	b.SetBytes(int64(len(bts)))
+-	b.ResetTimer()
+-	for i := 0; i < b.N; i++ {
+-		_, err := v.UnmarshalMsg(bts)
+-		if err != nil {
+-			b.Fatal(err)
+-		}
+-	}
+-}
+-
+-func TestEncodeDecodeReadMultipleReq(t *testing.T) {
+-	v := ReadMultipleReq{}
+-	var buf bytes.Buffer
+-	msgp.Encode(&buf, &v)
+-
+-	m := v.Msgsize()
+-	if buf.Len() > m {
+-		t.Log("WARNING: TestEncodeDecodeReadMultipleReq Msgsize() is inaccurate")
+-	}
+-
+-	vn := ReadMultipleReq{}
+-	err := msgp.Decode(&buf, &vn)
+-	if err != nil {
+-		t.Error(err)
+-	}
+-
+-	buf.Reset()
+-	msgp.Encode(&buf, &v)
+-	err = msgp.NewReader(&buf).Skip()
+-	if err != nil {
+-		t.Error(err)
+-	}
+-}
+-
+-func BenchmarkEncodeReadMultipleReq(b *testing.B) {
+-	v := ReadMultipleReq{}
+-	var buf bytes.Buffer
+-	msgp.Encode(&buf, &v)
+-	b.SetBytes(int64(buf.Len()))
+-	en := msgp.NewWriter(msgp.Nowhere)
+-	b.ReportAllocs()
+-	b.ResetTimer()
+-	for i := 0; i < b.N; i++ {
+-		v.EncodeMsg(en)
+-	}
+-	en.Flush()
+-}
+-
+-func BenchmarkDecodeReadMultipleReq(b *testing.B) {
+-	v := ReadMultipleReq{}
+-	var buf bytes.Buffer
+-	msgp.Encode(&buf, &v)
+-	b.SetBytes(int64(buf.Len()))
+-	rd := msgp.NewEndlessReader(buf.Bytes(), b)
+-	dc := msgp.NewReader(rd)
+-	b.ReportAllocs()
+-	b.ResetTimer()
+-	for i := 0; i < b.N; i++ {
+-		err := v.DecodeMsg(dc)
+-		if err != nil {
+-			b.Fatal(err)
+-		}
+-	}
+-}
+-
+-func TestMarshalUnmarshalReadMultipleResp(t *testing.T) {
+-	v := ReadMultipleResp{}
+-	bts, err := v.MarshalMsg(nil)
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-	left, err := v.UnmarshalMsg(bts)
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-	if len(left) > 0 {
+-		t.Errorf("%d bytes left over after UnmarshalMsg(): %q", len(left), left)
+-	}
+-
+-	left, err = msgp.Skip(bts)
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-	if len(left) > 0 {
+-		t.Errorf("%d bytes left over after Skip(): %q", len(left), left)
+-	}
+-}
+-
+-func BenchmarkMarshalMsgReadMultipleResp(b *testing.B) {
+-	v := ReadMultipleResp{}
+-	b.ReportAllocs()
+-	b.ResetTimer()
+-	for i := 0; i < b.N; i++ {
+-		v.MarshalMsg(nil)
+-	}
+-}
+-
+-func BenchmarkAppendMsgReadMultipleResp(b *testing.B) {
+-	v := ReadMultipleResp{}
+-	bts := make([]byte, 0, v.Msgsize())
+-	bts, _ = v.MarshalMsg(bts[0:0])
+-	b.SetBytes(int64(len(bts)))
+-	b.ReportAllocs()
+-	b.ResetTimer()
+-	for i := 0; i < b.N; i++ {
+-		bts, _ = v.MarshalMsg(bts[0:0])
+-	}
+-}
+-
+-func BenchmarkUnmarshalReadMultipleResp(b *testing.B) {
+-	v := ReadMultipleResp{}
+-	bts, _ := v.MarshalMsg(nil)
+-	b.ReportAllocs()
+-	b.SetBytes(int64(len(bts)))
+-	b.ResetTimer()
+-	for i := 0; i < b.N; i++ {
+-		_, err := v.UnmarshalMsg(bts)
+-		if err != nil {
+-			b.Fatal(err)
+-		}
+-	}
+-}
+-
+-func TestEncodeDecodeReadMultipleResp(t *testing.T) {
+-	v := ReadMultipleResp{}
+-	var buf bytes.Buffer
+-	msgp.Encode(&buf, &v)
+-
+-	m := v.Msgsize()
+-	if buf.Len() > m {
+-		t.Log("WARNING: TestEncodeDecodeReadMultipleResp Msgsize() is inaccurate")
+-	}
+-
+-	vn := ReadMultipleResp{}
+-	err := msgp.Decode(&buf, &vn)
+-	if err != nil {
+-		t.Error(err)
+-	}
+-
+-	buf.Reset()
+-	msgp.Encode(&buf, &v)
+-	err = msgp.NewReader(&buf).Skip()
+-	if err != nil {
+-		t.Error(err)
+-	}
+-}
+-
+-func BenchmarkEncodeReadMultipleResp(b *testing.B) {
+-	v := ReadMultipleResp{}
+-	var buf bytes.Buffer
+-	msgp.Encode(&buf, &v)
+-	b.SetBytes(int64(buf.Len()))
+-	en := msgp.NewWriter(msgp.Nowhere)
+-	b.ReportAllocs()
+-	b.ResetTimer()
+-	for i := 0; i < b.N; i++ {
+-		v.EncodeMsg(en)
+-	}
+-	en.Flush()
+-}
+-
+-func BenchmarkDecodeReadMultipleResp(b *testing.B) {
+-	v := ReadMultipleResp{}
+-	var buf bytes.Buffer
+-	msgp.Encode(&buf, &v)
+-	b.SetBytes(int64(buf.Len()))
+-	rd := msgp.NewEndlessReader(buf.Bytes(), b)
+-	dc := msgp.NewReader(rd)
+-	b.ReportAllocs()
+-	b.ResetTimer()
+-	for i := 0; i < b.N; i++ {
+-		err := v.DecodeMsg(dc)
+-		if err != nil {
+-			b.Fatal(err)
+-		}
+-	}
+-}
+-
+ func TestMarshalUnmarshalReadPartsReq(t *testing.T) {
+ 	v := ReadPartsReq{}
+ 	bts, err := v.MarshalMsg(nil)
+diff --git a/cmd/storage-interface.go b/cmd/storage-interface.go
+index 3c26504875e9d..938d4ade3a5d7 100644
+--- a/cmd/storage-interface.go
++++ b/cmd/storage-interface.go
+@@ -101,7 +101,6 @@ type StorageAPI interface {
+ 	VerifyFile(ctx context.Context, volume, path string, fi FileInfo) (*CheckPartsResp, error)
+ 	StatInfoFile(ctx context.Context, volume, path string, glob bool) (stat []StatInfo, err error)
+ 	ReadParts(ctx context.Context, bucket string, partMetaPaths ...string) ([]*ObjectPartInfo, error)
+-	ReadMultiple(ctx context.Context, req ReadMultipleReq, resp chan<- ReadMultipleResp) error
+ 	CleanAbandonedData(ctx context.Context, volume string, path string) error
+ 
+ 	// Write all data, syncs the data to disk.
+diff --git a/cmd/storage-rest-client.go b/cmd/storage-rest-client.go
+index d3c17a17fde06..b96393ee349d1 100644
+--- a/cmd/storage-rest-client.go
++++ b/cmd/storage-rest-client.go
+@@ -912,45 +912,6 @@ func (client *storageRESTClient) StatInfoFile(ctx context.Context, volume, path
+ 	return stat, toStorageErr(err)
+ }
+ 
+-// ReadMultiple will read multiple files and send each back as response.
+-// Files are read and returned in the given order.
+-// The resp channel is closed before the call returns.
+-// Only a canceled context or network errors returns an error.
+-func (client *storageRESTClient) ReadMultiple(ctx context.Context, req ReadMultipleReq, resp chan<- ReadMultipleResp) error {
+-	defer xioutil.SafeClose(resp)
+-	body, err := req.MarshalMsg(nil)
+-	if err != nil {
+-		return err
+-	}
+-	respBody, err := client.call(ctx, storageRESTMethodReadMultiple, nil, bytes.NewReader(body), int64(len(body)))
+-	if err != nil {
+-		return err
+-	}
+-	defer xhttp.DrainBody(respBody)
+-
+-	pr, pw := io.Pipe()
+-	go func() {
+-		pw.CloseWithError(waitForHTTPStream(respBody, xioutil.NewDeadlineWriter(pw, globalDriveConfig.GetMaxTimeout())))
+-	}()
+-	mr := msgp.NewReader(pr)
+-	defer readMsgpReaderPoolPut(mr)
+-	for {
+-		var file ReadMultipleResp
+-		if err := file.DecodeMsg(mr); err != nil {
+-			if errors.Is(err, io.EOF) {
+-				err = nil
+-			}
+-			pr.CloseWithError(err)
+-			return toStorageErr(err)
+-		}
+-		select {
+-		case <-ctx.Done():
+-			return ctx.Err()
+-		case resp <- file:
+-		}
+-	}
+-}
+-
+ // CleanAbandonedData will read metadata of the object on disk
+ // and delete any data directories and inline data that isn't referenced in metadata.
+ func (client *storageRESTClient) CleanAbandonedData(ctx context.Context, volume string, path string) error {
+diff --git a/cmd/storage-rest-common.go b/cmd/storage-rest-common.go
+index 361045de2d768..d8a28ae29e164 100644
+--- a/cmd/storage-rest-common.go
++++ b/cmd/storage-rest-common.go
+@@ -41,7 +41,6 @@ const (
+ 	storageRESTMethodRenameFile     = "/rfile"
+ 	storageRESTMethodVerifyFile     = "/vfile"
+ 	storageRESTMethodStatInfoFile   = "/sfile"
+-	storageRESTMethodReadMultiple   = "/rmpl"
+ 	storageRESTMethodCleanAbandoned = "/cln"
+ 	storageRESTMethodDeleteBulk     = "/dblk"
+ 	storageRESTMethodReadParts      = "/rps"
+diff --git a/cmd/storage-rest-server.go b/cmd/storage-rest-server.go
+index 927571b3dd2b7..d7ee11493ff03 100644
+--- a/cmd/storage-rest-server.go
++++ b/cmd/storage-rest-server.go
+@@ -28,7 +28,6 @@ import (
+ 	"net/http"
+ 	"os/user"
+ 	"path"
+-	"runtime/debug"
+ 	"strconv"
+ 	"strings"
+ 	"sync"
+@@ -1283,48 +1282,6 @@ func (s *storageRESTServer) DeleteBulkHandler(w http.ResponseWriter, r *http.Req
+ 	keepHTTPResponseAlive(w)(s.getStorage().DeleteBulk(r.Context(), volume, req.Paths...))
+ }
+ 
+-// ReadMultiple returns multiple files
+-func (s *storageRESTServer) ReadMultiple(w http.ResponseWriter, r *http.Request) {
+-	if !s.IsValid(w, r) {
+-		return
+-	}
+-	rw := streamHTTPResponse(w)
+-	defer func() {
+-		if r := recover(); r != nil {
+-			debug.PrintStack()
+-			rw.CloseWithError(fmt.Errorf("panic: %v", r))
+-		}
+-	}()
+-
+-	var req ReadMultipleReq
+-	mr := msgpNewReader(r.Body)
+-	defer readMsgpReaderPoolPut(mr)
+-	err := req.DecodeMsg(mr)
+-	if err != nil {
+-		rw.CloseWithError(err)
+-		return
+-	}
+-
+-	mw := msgp.NewWriter(rw)
+-	responses := make(chan ReadMultipleResp, len(req.Files))
+-	var wg sync.WaitGroup
+-	wg.Add(1)
+-	go func() {
+-		defer wg.Done()
+-		for resp := range responses {
+-			err := resp.EncodeMsg(mw)
+-			if err != nil {
+-				rw.CloseWithError(err)
+-				return
+-			}
+-			mw.Flush()
+-		}
+-	}()
+-	err = s.getStorage().ReadMultiple(r.Context(), req, responses)
+-	wg.Wait()
+-	rw.CloseWithError(err)
+-}
+-
+ // globalLocalSetDrives is used for local drive as well as remote REST
+ // API caller for other nodes to talk to this node.
+ //
+@@ -1363,7 +1320,6 @@ func registerStorageRESTHandlers(router *mux.Router, endpointServerPools Endpoin
+ 			subrouter.Methods(http.MethodPost).Path(storageRESTVersionPrefix + storageRESTMethodDeleteVersions).HandlerFunc(h(server.DeleteVersionsHandler))
+ 			subrouter.Methods(http.MethodPost).Path(storageRESTVersionPrefix + storageRESTMethodVerifyFile).HandlerFunc(h(server.VerifyFileHandler))
+ 			subrouter.Methods(http.MethodPost).Path(storageRESTVersionPrefix + storageRESTMethodStatInfoFile).HandlerFunc(h(server.StatInfoFile))
+-			subrouter.Methods(http.MethodPost).Path(storageRESTVersionPrefix + storageRESTMethodReadMultiple).HandlerFunc(h(server.ReadMultiple))
+ 			subrouter.Methods(http.MethodPost).Path(storageRESTVersionPrefix + storageRESTMethodCleanAbandoned).HandlerFunc(h(server.CleanAbandonedDataHandler))
+ 			subrouter.Methods(http.MethodPost).Path(storageRESTVersionPrefix + storageRESTMethodDeleteBulk).HandlerFunc(h(server.DeleteBulkHandler))
+ 			subrouter.Methods(http.MethodPost).Path(storageRESTVersionPrefix + storageRESTMethodReadParts).HandlerFunc(h(server.ReadPartsHandler))
+diff --git a/cmd/storagemetric_string.go b/cmd/storagemetric_string.go
+index 794781329dbc3..21fa89e1c3567 100644
+--- a/cmd/storagemetric_string.go
++++ b/cmd/storagemetric_string.go
+@@ -33,18 +33,17 @@ func _() {
+ 	_ = x[storageMetricReadXL-22]
+ 	_ = x[storageMetricReadAll-23]
+ 	_ = x[storageMetricStatInfoFile-24]
+-	_ = x[storageMetricReadMultiple-25]
+-	_ = x[storageMetricDeleteAbandonedParts-26]
+-	_ = x[storageMetricDiskInfo-27]
+-	_ = x[storageMetricDeleteBulk-28]
+-	_ = x[storageMetricRenamePart-29]
+-	_ = x[storageMetricReadParts-30]
+-	_ = x[storageMetricLast-31]
++	_ = x[storageMetricDeleteAbandonedParts-25]
++	_ = x[storageMetricDiskInfo-26]
++	_ = x[storageMetricDeleteBulk-27]
++	_ = x[storageMetricRenamePart-28]
++	_ = x[storageMetricReadParts-29]
++	_ = x[storageMetricLast-30]
+ }
+ 
+-const _storageMetric_name = "MakeVolBulkMakeVolListVolsStatVolDeleteVolWalkDirListDirReadFileAppendFileCreateFileReadFileStreamRenameFileRenameDataCheckPartsDeleteDeleteVersionsVerifyFileWriteAllDeleteVersionWriteMetadataUpdateMetadataReadVersionReadXLReadAllStatInfoFileReadMultipleDeleteAbandonedPartsDiskInfoDeleteBulkRenamePartReadPartsLast"
++const _storageMetric_name = "MakeVolBulkMakeVolListVolsStatVolDeleteVolWalkDirListDirReadFileAppendFileCreateFileReadFileStreamRenameFileRenameDataCheckPartsDeleteDeleteVersionsVerifyFileWriteAllDeleteVersionWriteMetadataUpdateMetadataReadVersionReadXLReadAllStatInfoFileDeleteAbandonedPartsDiskInfoDeleteBulkRenamePartReadPartsLast"
+ 
+-var _storageMetric_index = [...]uint16{0, 11, 18, 26, 33, 42, 49, 56, 64, 74, 84, 98, 108, 118, 128, 134, 148, 158, 166, 179, 192, 206, 217, 223, 230, 242, 254, 274, 282, 292, 302, 311, 315}
++var _storageMetric_index = [...]uint16{0, 11, 18, 26, 33, 42, 49, 56, 64, 74, 84, 98, 108, 118, 128, 134, 148, 158, 166, 179, 192, 206, 217, 223, 230, 242, 262, 270, 280, 290, 299, 303}
+ 
+ func (i storageMetric) String() string {
+ 	if i >= storageMetric(len(_storageMetric_index)-1) {
+diff --git a/cmd/xl-storage-disk-id-check.go b/cmd/xl-storage-disk-id-check.go
+index 89fac54936be4..3147d38a877bb 100644
+--- a/cmd/xl-storage-disk-id-check.go
++++ b/cmd/xl-storage-disk-id-check.go
+@@ -68,7 +68,6 @@ const (
+ 	storageMetricReadXL
+ 	storageMetricReadAll
+ 	storageMetricStatInfoFile
+-	storageMetricReadMultiple
+ 	storageMetricDeleteAbandonedParts
+ 	storageMetricDiskInfo
+ 	storageMetricDeleteBulk
+@@ -723,21 +722,6 @@ func (p *xlStorageDiskIDCheck) ReadParts(ctx context.Context, volume string, par
+ 	return p.storage.ReadParts(ctx, volume, partMetaPaths...)
+ }
+ 
+-// ReadMultiple will read multiple files and send each files as response.
+-// Files are read and returned in the given order.
+-// The resp channel is closed before the call returns.
+-// Only a canceled context will return an error.
+-func (p *xlStorageDiskIDCheck) ReadMultiple(ctx context.Context, req ReadMultipleReq, resp chan<- ReadMultipleResp) (err error) {
+-	ctx, done, err := p.TrackDiskHealth(ctx, storageMetricReadMultiple, req.Bucket, req.Prefix)
+-	if err != nil {
+-		xioutil.SafeClose(resp)
+-		return err
+-	}
+-	defer done(0, &err)
+-
+-	return p.storage.ReadMultiple(ctx, req, resp)
+-}
+-
+ // CleanAbandonedData will read metadata of the object on disk
+ // and delete any data directories and inline data that isn't referenced in metadata.
+ func (p *xlStorageDiskIDCheck) CleanAbandonedData(ctx context.Context, volume string, path string) (err error) {
+diff --git a/cmd/xl-storage.go b/cmd/xl-storage.go
+index 35d7ac73360af..0e7803bcf0a7b 100644
+--- a/cmd/xl-storage.go
++++ b/cmd/xl-storage.go
+@@ -3187,81 +3187,6 @@ func (s *xlStorage) ReadParts(ctx context.Context, volume string, partMetaPaths
+ 	return parts, nil
+ }
+ 
+-// ReadMultiple will read multiple files and send each back as response.
+-// Files are read and returned in the given order.
+-// The resp channel is closed before the call returns.
+-// Only a canceled context will return an error.
+-func (s *xlStorage) ReadMultiple(ctx context.Context, req ReadMultipleReq, resp chan<- ReadMultipleResp) error {
+-	defer xioutil.SafeClose(resp)
+-
+-	volumeDir := pathJoin(s.drivePath, req.Bucket)
+-	found := 0
+-	for _, f := range req.Files {
+-		if contextCanceled(ctx) {
+-			return ctx.Err()
+-		}
+-		r := ReadMultipleResp{
+-			Bucket: req.Bucket,
+-			Prefix: req.Prefix,
+-			File:   f,
+-		}
+-
+-		var data []byte
+-		var mt time.Time
+-
+-		fullPath := pathJoin(volumeDir, req.Prefix, f)
+-		w := xioutil.NewDeadlineWorker(globalDriveConfig.GetMaxTimeout())
+-		if err := w.Run(func() (err error) {
+-			if req.MetadataOnly {
+-				data, mt, err = s.readMetadataWithDMTime(ctx, fullPath)
+-			} else {
+-				data, mt, err = s.readAllDataWithDMTime(ctx, req.Bucket, volumeDir, fullPath)
+-			}
+-			return err
+-		}); err != nil {
+-			if !IsErr(err, errFileNotFound, errVolumeNotFound) {
+-				r.Exists = true
+-				r.Error = err.Error()
+-			}
+-			select {
+-			case <-ctx.Done():
+-				return ctx.Err()
+-			case resp <- r:
+-			}
+-			if req.AbortOn404 && !r.Exists {
+-				// We stop at first file not found.
+-				// We have already reported the error, return nil.
+-				return nil
+-			}
+-			continue
+-		}
+-		diskHealthCheckOK(ctx, nil)
+-		if req.MaxSize > 0 && int64(len(data)) > req.MaxSize {
+-			r.Exists = true
+-			r.Error = fmt.Sprintf("max size (%d) exceeded: %d", req.MaxSize, len(data))
+-			select {
+-			case <-ctx.Done():
+-				return ctx.Err()
+-			case resp <- r:
+-				continue
+-			}
+-		}
+-		found++
+-		r.Exists = true
+-		r.Data = data
+-		r.Modtime = mt
+-		select {
+-		case <-ctx.Done():
+-			return ctx.Err()
+-		case resp <- r:
+-		}
+-		if req.MaxResults > 0 && found >= req.MaxResults {
+-			return nil
+-		}
+-	}
+-	return nil
+-}
+-
+ func (s *xlStorage) StatInfoFile(ctx context.Context, volume, path string, glob bool) (stat []StatInfo, err error) {
+ 	volumeDir, err := s.getVolDir(volume)
+ 	if err != nil {

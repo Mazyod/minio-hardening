@@ -1,0 +1,10 @@
+*
+!Dockerfile
+!patches/
+!patches/**
+!dependencies/
+!dependencies/**
+!scripts/
+!scripts/**
+!LICENSE
+!NOTICE

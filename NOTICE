@@ -1,0 +1,20 @@
+OpenImage MinIO is an independent redistribution of MinIO with security patches.
+It is not affiliated with or endorsed by MinIO, Inc.
+
+MinIO: Copyright MinIO, Inc. and contributors.
+Upstream source: https://github.com/minio/minio
+Base: RELEASE.2025-10-15T17-29-55Z
+Commit: 9e49d5e7a648f00e26f2246f4dc28e6b07f8c84a
+License: GNU Affero General Public License, version 3 or later.
+
+Security backports: pgsty/silo contributors, under the same license.
+Source: https://github.com/pgsty/silo
+Original authorship and commit IDs are preserved in patches/.
+Patch 09 omits a documentation hunk whose context differs from this base.
+The authoritative deployment limitations are recorded in SECURITY.md.
+
+OpenImage build recipes and original changes: Copyright 2026 OpenImage
+contributors, under the GNU Affero General Public License, version 3 or later.
+
+Third-party dependencies retain their own licenses. Release source archives
+include vendored dependencies and their notices.

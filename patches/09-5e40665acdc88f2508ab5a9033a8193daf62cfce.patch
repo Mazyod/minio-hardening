@@ -1,0 +1,488 @@
+From 5e40665acdc88f2508ab5a9033a8193daf62cfce Mon Sep 17 00:00:00 2001
+From: Feng Ruohang <rh@vonng.com>
+Date: Fri, 12 Jun 2026 17:09:24 +0800
+Subject: [PATCH] fix: harden LDAP STS rate-limit source bucketing
+
+Remove the per-username LDAP STS throttle bucket and keep the limiter keyed only by source IP. A username bucket is shared across all clients and lets one source keep a known account's bucket drained with bad-password attempts, locking the legitimate user out before LDAP bind.
+
+For trusted proxies, stop trusting the left-most forwarded address. Resolve X-Forwarded-For right-to-left, skip trusted proxy hops, reject catch-all trusted-proxy CIDRs, and intentionally ignore RFC 7239 Forwarded for this security-sensitive bucket. Document that X-Real-IP is trusted verbatim and must be overwritten by the trusted proxy, not passed through from clients.
+
+Update focused limiter, source-IP, trusted-proxy, and LDAP config tests to cover source-only buckets, spoofed appended XFF, multi-hop trusted proxies, Forwarded fallback, catch-all rejection, and the X-Real-IP deployment contract.
+
+Co-authored-by: Codex <codex@openai.com>
+Co-authored-by: Claude Code <claude-code@anthropic.com>
+---
+ cmd/sts-handlers.go                        | 109 ++++++++-------
+ cmd/sts-handlers_test.go                   | 152 ++++++++++++---------
+ docs/sts/ldap.md                           |  12 +-
+ internal/config/identity/ldap/config.go    |   8 +-
+ internal/config/identity/ldap/ldap_test.go |   9 ++
+ 5 files changed, 170 insertions(+), 120 deletions(-)
+
+diff --git a/cmd/sts-handlers.go b/cmd/sts-handlers.go
+index af1981cc3c999..8b8f9388cdb4d 100644
+--- a/cmd/sts-handlers.go
++++ b/cmd/sts-handlers.go
+@@ -37,7 +37,6 @@ import (
+ 	"github.com/minio/minio/internal/auth"
+ 	idldap "github.com/minio/minio/internal/config/identity/ldap"
+ 	"github.com/minio/minio/internal/config/identity/openid"
+-	"github.com/minio/minio/internal/handlers"
+ 	"github.com/minio/minio/internal/hash/sha256"
+ 	xhttp "github.com/minio/minio/internal/http"
+ 	"github.com/minio/minio/internal/logger"
+@@ -267,14 +266,22 @@ func getTokenSigningKey() (string, error) {
+ 	return secret, nil
+ }
+ 
++// stsLDAPLoginRateLimiter throttles LDAP STS logins per source IP. It does not
++// bucket by username on purpose: a username-keyed bucket is shared across all
++// sources, so a single client sending bad-password attempts for a known account
++// could keep that account's bucket drained and lock the legitimate user out.
++//
++// Scope of protection: the per-source bucket caps the attempt rate from any one
++// source, and the uniform auth-failure response (not this limiter) is what hides
++// whether a username exists. It does not stop attackers who spread across many
++// sources (botnets, IPv6 address rotation) or the residual bind-timing side
++// channel; those are accepted limitations of an in-memory, per-source control.
+ type stsLDAPLoginRateLimiter struct {
+ 	source *stsLDAPLoginKeyLimiterSet
+-	user   *stsLDAPLoginKeyLimiterSet
+ }
+ 
+ type stsLDAPLoginReservation struct {
+ 	source *stsLDAPLoginKeyReservation
+-	user   *stsLDAPLoginKeyReservation
+ }
+ 
+ type stsLDAPLoginKeyLimiterSet struct {
+@@ -302,7 +309,6 @@ type stsLDAPLoginKeyReservation struct {
+ func newSTSLDAPLoginRateLimiter(refillEvery time.Duration, burst int, ttl time.Duration) *stsLDAPLoginRateLimiter {
+ 	return &stsLDAPLoginRateLimiter{
+ 		source: newSTSLDAPLoginKeyLimiterSet(refillEvery, burst, ttl),
+-		user:   newSTSLDAPLoginKeyLimiterSet(refillEvery, burst, ttl),
+ 	}
+ }
+ 
+@@ -315,12 +321,8 @@ func newSTSLDAPLoginKeyLimiterSet(refillEvery time.Duration, burst int, ttl time
+ 	}
+ }
+ 
+-func normalizeSTSLDAPUsername(username string) string {
+-	return strings.ToLower(strings.TrimSpace(username))
+-}
+-
+-func (l *stsLDAPLoginRateLimiter) Allow(sourceIP, username string) bool {
+-	reservation := l.Reserve(sourceIP, username)
++func (l *stsLDAPLoginRateLimiter) Allow(sourceIP string) bool {
++	reservation := l.Reserve(sourceIP)
+ 	if reservation == nil {
+ 		return false
+ 	}
+@@ -328,55 +330,34 @@ func (l *stsLDAPLoginRateLimiter) Allow(sourceIP, username string) bool {
+ 	return true
+ }
+ 
+-func (l *stsLDAPLoginRateLimiter) Reserve(sourceIP, username string) *stsLDAPLoginReservation {
+-	now := UTCNow()
+-	reservation := &stsLDAPLoginReservation{}
+-
+-	if sourceIP != "" {
+-		reservation.source = l.source.Reserve(now, sourceIP)
+-		if reservation.source == nil {
+-			return nil
+-		}
++func (l *stsLDAPLoginRateLimiter) Reserve(sourceIP string) *stsLDAPLoginReservation {
++	// An empty source IP means we could not identify the peer; do not throttle
++	// rather than collapse every such request into one shared bucket.
++	if sourceIP == "" {
++		return &stsLDAPLoginReservation{}
+ 	}
+ 
+-	username = normalizeSTSLDAPUsername(username)
+-	if username != "" {
+-		reservation.user = l.user.Reserve(now, username)
+-		if reservation.user == nil {
+-			reservation.Cancel()
+-			return nil
+-		}
++	source := l.source.Reserve(UTCNow(), sourceIP)
++	if source == nil {
++		return nil
+ 	}
+-
+-	return reservation
++	return &stsLDAPLoginReservation{source: source}
+ }
+ 
+ func (r *stsLDAPLoginReservation) Commit() {
+-	if r == nil {
++	if r == nil || r.source == nil {
+ 		return
+ 	}
+-	if r.source != nil {
+-		r.source.CommitAt(UTCNow())
+-		r.source = nil
+-	}
+-	if r.user != nil {
+-		r.user.CommitAt(UTCNow())
+-		r.user = nil
+-	}
++	r.source.CommitAt(UTCNow())
++	r.source = nil
+ }
+ 
+ func (r *stsLDAPLoginReservation) Cancel() {
+-	if r == nil {
++	if r == nil || r.source == nil {
+ 		return
+ 	}
+-	if r.source != nil {
+-		r.source.CancelAt(UTCNow())
+-		r.source = nil
+-	}
+-	if r.user != nil {
+-		r.user.CancelAt(UTCNow())
+-		r.user = nil
+-	}
++	r.source.CancelAt(UTCNow())
++	r.source = nil
+ }
+ 
+ func (l *stsLDAPLoginKeyLimiterSet) Allow(now time.Time, key string) bool {
+@@ -510,11 +491,37 @@ func getSTSLDAPLoginSourceIP(r *http.Request) string {
+ 	return sourceIP
+ }
+ 
++// getSTSLDAPTrustedProxySourceIP resolves the client IP for a request whose peer
++// is an allow-listed trusted proxy. A single clean X-Real-IP is preferred; for
++// X-Forwarded-For we walk the chain right-to-left and skip trusted-proxy hops,
++// returning the first untrusted address. The XFF result ignores any client-
++// supplied (left-most) value unless the entire chain to its right is trusted,
++// which an external client cannot forge.
++//
++// X-Real-IP, unlike XFF, is a single value with no chain, so it cannot be
++// validated against the allowlist: it is trusted verbatim. The deployment
++// contract is therefore that the trusted proxy MUST overwrite (not pass through)
++// any client-supplied X-Real-IP; otherwise an attacker can vary it per request
++// to evade per-source throttling. This is the standard reverse-proxy real-IP
++// contract; reordering to prefer XFF would not remove the dependency, only move
++// it (an X-Real-IP-only proxy would then be evaded via an injected XFF header).
++//
++// The RFC 7239 Forwarded header is intentionally not honored here; such
++// deployments fall back to the safe peer-address bucket.
+ func getSTSLDAPTrustedProxySourceIP(r *http.Request) string {
+ 	if realIP := getSTSLDAPLoginCanonicalIP(r.Header.Get("X-Real-IP")); realIP != "" {
+ 		return realIP
+ 	}
+-	return getSTSLDAPLoginCanonicalIP(handlers.GetSourceIPFromHeaders(r))
++
++	forwarded := strings.Split(r.Header.Get("X-Forwarded-For"), ",")
++	for i := len(forwarded) - 1; i >= 0; i-- {
++		ip := getSTSLDAPLoginCanonicalIP(forwarded[i])
++		if ip == "" || globalIAMSys.LDAPConfig.IsSTSTrustedProxy(ip) {
++			continue
++		}
++		return ip
++	}
++	return ""
+ }
+ 
+ func getSTSLDAPLoginPeerAddr(remoteAddr string) string {
+@@ -535,11 +542,11 @@ func getSTSLDAPLoginCanonicalIP(addr string) string {
+ 	return ""
+ }
+ 
+-// reserveSTSLDAPLogin acquires immediate tokens from the per-source and
+-// per-username limiters before contacting LDAP. Call Commit on auth failures
+-// and Cancel when the attempt should not count as an authentication failure.
++// reserveSTSLDAPLogin acquires an immediate token from the per-source limiter
++// before contacting LDAP. Call Commit on auth failures and Cancel when the
++// attempt should not count as an authentication failure.
+ func reserveSTSLDAPLogin(r *http.Request) *stsLDAPLoginReservation {
+-	return globalSTSLDAPLoginRateLimiter.Reserve(getSTSLDAPLoginSourceIP(r), r.Form.Get(stsLDAPUsername))
++	return globalSTSLDAPLoginRateLimiter.Reserve(getSTSLDAPLoginSourceIP(r))
+ }
+ 
+ func ldapBindErrorToSTS(err error) (STSErrorCode, error) {
+diff --git a/cmd/sts-handlers_test.go b/cmd/sts-handlers_test.go
+index 901b09ef82313..f4aa65981ee10 100644
+--- a/cmd/sts-handlers_test.go
++++ b/cmd/sts-handlers_test.go
+@@ -1415,53 +1415,51 @@ func targetIsLDAPAuthFailure(target error) bool {
+ func TestSTSLDAPLoginRateLimiter(t *testing.T) {
+ 	limiter := newSTSLDAPLoginRateLimiter(time.Hour, 2, time.Minute)
+ 
+-	if !limiter.Allow("192.0.2.10", "dillon") {
++	if !limiter.Allow("192.0.2.10") {
+ 		t.Fatal("expected first attempt to be allowed")
+ 	}
+-	if !limiter.Allow("192.0.2.10", "kevin") {
+-		t.Fatal("expected second source-IP attempt to be allowed")
++	if !limiter.Allow("192.0.2.10") {
++		t.Fatal("expected second attempt within burst to be allowed")
+ 	}
+-	if limiter.Allow("192.0.2.10", "stuart") {
+-		t.Fatal("expected source IP bucket to be throttled")
++	if limiter.Allow("192.0.2.10") {
++		t.Fatal("expected source IP bucket to be throttled after burst")
+ 	}
+ 
+-	limiter = newSTSLDAPLoginRateLimiter(time.Hour, 2, time.Minute)
+-	if !limiter.Allow("192.0.2.10", "dillon") {
+-		t.Fatal("expected first username attempt to be allowed")
++	// A different source IP has its own independent bucket, so one client
++	// cannot exhaust another's budget (no per-username lockout dimension).
++	if !limiter.Allow("192.0.2.11") {
++		t.Fatal("expected a different source IP to be allowed")
+ 	}
+-	if !limiter.Allow("192.0.2.11", "dillon") {
+-		t.Fatal("expected second username attempt from a different source to be allowed")
+-	}
+-	if limiter.Allow("192.0.2.12", "dillon") {
+-		t.Fatal("expected username bucket to be throttled")
+-	}
+-	if !limiter.Allow("192.0.2.12", "other-user") {
+-		t.Fatal("expected a fresh username and source tuple to be allowed")
++
++	// An empty source IP cannot be identified and must never be throttled,
++	// otherwise all such requests would collapse into one shared bucket.
++	if !limiter.Allow("") || !limiter.Allow("") {
++		t.Fatal("expected unidentified source to stay unthrottled")
+ 	}
+ }
+ 
+ func TestSTSLDAPLoginRateLimiterReserveCancel(t *testing.T) {
+ 	limiter := newSTSLDAPLoginRateLimiter(time.Hour, 1, time.Minute)
+ 
+-	reservation := limiter.Reserve("192.0.2.10", "dillon")
++	reservation := limiter.Reserve("192.0.2.10")
+ 	if reservation == nil {
+ 		t.Fatal("expected first reservation to succeed")
+ 	}
+-	if limiter.Reserve("192.0.2.10", "kevin") != nil {
++	if limiter.Reserve("192.0.2.10") != nil {
+ 		t.Fatal("expected second reservation on the same source IP to be throttled before cancel")
+ 	}
+ 
+ 	reservation.Cancel()
+ 
+-	reservation = limiter.Reserve("192.0.2.10", "kevin")
++	reservation = limiter.Reserve("192.0.2.10")
+ 	if reservation == nil {
+ 		t.Fatal("expected canceled reservation to restore source-IP capacity")
+ 	}
+ 	reservation.Cancel()
+ 
+-	reservation = limiter.Reserve("192.0.2.11", "dillon")
++	reservation = limiter.Reserve("192.0.2.11")
+ 	if reservation == nil {
+-		t.Fatal("expected canceled reservation to restore username capacity")
++		t.Fatal("expected a different source IP to have independent capacity")
+ 	}
+ 	reservation.Cancel()
+ }
+@@ -1495,26 +1493,6 @@ func TestSTSLDAPLoginKeyLimiterCancelDoesNotOverCreditAfterRefill(t *testing.T)
+ 	second.CancelAt(start.Add(10 * time.Millisecond))
+ }
+ 
+-func TestSTSLDAPLoginRateLimiterReserveRollbackOnCompositeFailure(t *testing.T) {
+-	limiter := newSTSLDAPLoginRateLimiter(time.Hour, 1, time.Minute)
+-
+-	reservation := limiter.Reserve("192.0.2.10", "dillon")
+-	if reservation == nil {
+-		t.Fatal("expected initial reservation to succeed")
+-	}
+-	defer reservation.Cancel()
+-
+-	if limiter.Reserve("192.0.2.11", "dillon") != nil {
+-		t.Fatal("expected second reservation for the same username to be throttled")
+-	}
+-
+-	reservation2 := limiter.Reserve("192.0.2.11", "kevin")
+-	if reservation2 == nil {
+-		t.Fatal("expected throttled username reservation to roll back the provisional source-IP reservation")
+-	}
+-	reservation2.Cancel()
+-}
+-
+ func TestSTSLDAPLoginRateLimiterConcurrentReserveLifecycle(t *testing.T) {
+ 	limiter := newSTSLDAPLoginRateLimiter(time.Hour, 4, time.Minute)
+ 
+@@ -1533,7 +1511,7 @@ func TestSTSLDAPLoginRateLimiterConcurrentReserveLifecycle(t *testing.T) {
+ 			defer wg.Done()
+ 			<-start
+ 
+-			reservations[worker] = limiter.Reserve("192.0.2.10", "dillon")
++			reservations[worker] = limiter.Reserve("192.0.2.10")
+ 			reserveWG.Done()
+ 			if reservations[worker] == nil {
+ 				return
+@@ -1568,7 +1546,7 @@ func TestSTSLDAPLoginRateLimiterConcurrentReserveLifecycle(t *testing.T) {
+ 
+ 	remainingBudget := 0
+ 	for {
+-		reservation := limiter.Reserve("192.0.2.10", "dillon")
++		reservation := limiter.Reserve("192.0.2.10")
+ 		if reservation == nil {
+ 			break
+ 		}
+@@ -1650,7 +1628,7 @@ func TestGetSTSLDAPLoginSourceIPUsesForwardedHeadersForTrustedProxy(t *testing.T
+ 		{
+ 			name:        "x-forwarded-for",
+ 			headerKey:   "X-Forwarded-For",
+-			headerValue: "203.0.113.10, 198.51.100.24",
++			headerValue: "203.0.113.10",
+ 			want:        "203.0.113.10",
+ 		},
+ 		{
+@@ -1659,12 +1637,6 @@ func TestGetSTSLDAPLoginSourceIPUsesForwardedHeadersForTrustedProxy(t *testing.T
+ 			headerValue: "203.0.113.10",
+ 			want:        "203.0.113.10",
+ 		},
+-		{
+-			name:        "forwarded",
+-			headerKey:   "Forwarded",
+-			headerValue: `for=203.0.113.10;proto=https`,
+-			want:        "203.0.113.10",
+-		},
+ 	}
+ 
+ 	withLDAPSTSTrustedProxiesForTest(t, "192.0.2.0/24", func() {
+@@ -1683,6 +1655,49 @@ func TestGetSTSLDAPLoginSourceIPUsesForwardedHeadersForTrustedProxy(t *testing.T
+ 	})
+ }
+ 
++// A client behind a trusted, appending proxy can prepend a spoofed left-most
++// X-Forwarded-For value. The right-to-left walk must skip only trusted hops and
++// return the real (right-most untrusted) client, ignoring the spoofed value.
++func TestGetSTSLDAPLoginSourceIPTrustedProxyStripsSpoofedForwardedFor(t *testing.T) {
++	withLDAPSTSTrustedProxiesForTest(t, "192.0.2.0/24", func() {
++		req := &http.Request{
++			Header:     singleHeader("X-Forwarded-For", "1.2.3.4, 198.51.100.50"),
++			RemoteAddr: "192.0.2.10:9000",
++		}
++		if got := getSTSLDAPLoginSourceIP(req); got != "198.51.100.50" {
++			t.Fatalf("expected spoofed left-most XFF entry to be ignored and real client returned, got %q", got)
++		}
++	})
++}
++
++// When several hops in the chain are trusted proxies, the walk skips all of
++// them and resolves the left-most (real client) address.
++func TestGetSTSLDAPLoginSourceIPTrustedProxyWalksMultipleTrustedHops(t *testing.T) {
++	withLDAPSTSTrustedProxiesForTest(t, "192.0.2.0/24", func() {
++		req := &http.Request{
++			Header:     singleHeader("X-Forwarded-For", "203.0.113.10, 192.0.2.20, 192.0.2.21"),
++			RemoteAddr: "192.0.2.10:9000",
++		}
++		if got := getSTSLDAPLoginSourceIP(req); got != "203.0.113.10" {
++			t.Fatalf("expected walk to skip trusted hops and return real client, got %q", got)
++		}
++	})
++}
++
++// The RFC 7239 Forwarded header is not honored for trusted-proxy bucketing; such
++// requests fall back to the safe peer-address bucket.
++func TestGetSTSLDAPLoginSourceIPTrustedProxyIgnoresForwardedHeader(t *testing.T) {
++	withLDAPSTSTrustedProxiesForTest(t, "192.0.2.0/24", func() {
++		req := &http.Request{
++			Header:     singleHeader("Forwarded", `for=203.0.113.10;proto=https`),
++			RemoteAddr: "192.0.2.10:9000",
++		}
++		if got := getSTSLDAPLoginSourceIP(req); got != "192.0.2.10" {
++			t.Fatalf("expected RFC 7239 Forwarded to be ignored and peer address used, got %q", got)
++		}
++	})
++}
++
+ func TestGetSTSLDAPLoginSourceIPTrustedProxyPrefersXRealIPOverXForwardedFor(t *testing.T) {
+ 	withLDAPSTSTrustedProxiesForTest(t, "192.0.2.0/24", func() {
+ 		req := &http.Request{
+@@ -1698,6 +1713,29 @@ func TestGetSTSLDAPLoginSourceIPTrustedProxyPrefersXRealIPOverXForwardedFor(t *t
+ 	})
+ }
+ 
++// X-Real-IP is trusted verbatim (it cannot be chain-validated like X-Forwarded-For),
++// so a client-supplied X-Real-IP that the proxy fails to overwrite wins even over a
++// correctly appended X-Forwarded-For chain. This locks the documented deployment
++// contract: the trusted proxy MUST overwrite X-Real-IP, otherwise it is a spoofing
++// vector. If this assertion ever changes, the change must be deliberate.
++func TestGetSTSLDAPLoginSourceIPTrustedProxyTrustsXRealIPVerbatim(t *testing.T) {
++	withLDAPSTSTrustedProxiesForTest(t, "192.0.2.0/24", func() {
++		req := &http.Request{
++			Header:     make(http.Header),
++			RemoteAddr: "192.0.2.10:9000",
++		}
++		// Attacker spoofs X-Real-IP with a value that appears nowhere in the XFF
++		// chain; the trusted proxy still appends the real client (198.51.100.50).
++		// The spoofed X-Real-IP wins, so the result can only have come from it.
++		req.Header.Set("X-Real-IP", "10.10.10.10")
++		req.Header.Set("X-Forwarded-For", "1.1.1.1, 198.51.100.50")
++
++		if got := getSTSLDAPLoginSourceIP(req); got != "10.10.10.10" {
++			t.Fatalf("expected verbatim X-Real-IP trust (spoofable contract), got %q", got)
++		}
++	})
++}
++
+ func TestGetSTSLDAPLoginSourceIPTrustedProxyFallsBackToPeerWithoutForwardingHeaders(t *testing.T) {
+ 	withLDAPSTSTrustedProxiesForTest(t, "192.0.2.0/24", func() {
+ 		req := &http.Request{RemoteAddr: "192.0.2.10:9000"}
+@@ -1890,20 +1928,6 @@ func TestLDAPBindErrorToSTS(t *testing.T) {
+ 	}
+ }
+ 
+-func TestSTSLDAPLoginRateLimiterUsernameNormalization(t *testing.T) {
+-	limiter := newSTSLDAPLoginRateLimiter(time.Hour, 2, time.Minute)
+-
+-	if !limiter.Allow("192.0.2.10", "Admin") {
+-		t.Fatal("expected first username variant to be allowed")
+-	}
+-	if !limiter.Allow("192.0.2.11", " admin ") {
+-		t.Fatal("expected trimmed lowercase-equivalent username to be allowed")
+-	}
+-	if limiter.Allow("192.0.2.12", "ADMIN") {
+-		t.Fatal("expected username normalization to hit the same bucket")
+-	}
+-}
+-
+ func TestSTSLDAPLoginRateLimiterCleanup(t *testing.T) {
+ 	set := newSTSLDAPLoginKeyLimiterSet(time.Hour, 1, time.Minute)
+ 	start := time.Unix(0, 0)
+diff --git a/internal/config/identity/ldap/config.go b/internal/config/identity/ldap/config.go
+index 1aac4cbcc13e3..65808c90bba6b 100644
+--- a/internal/config/identity/ldap/config.go
++++ b/internal/config/identity/ldap/config.go
+@@ -184,7 +184,13 @@ func parseSTSTrustedProxies(value string) ([]netip.Prefix, error) {
+ 	prefixes := make([]netip.Prefix, 0, len(fields))
+ 	for _, field := range fields {
+ 		if prefix, err := netip.ParsePrefix(field); err == nil {
+-			prefixes = append(prefixes, prefix.Masked())
++			masked := prefix.Masked()
++			// Reject catch-all ranges (0.0.0.0/0, ::/0): they would trust
++			// forwarded headers from every peer and defeat the allowlist.
++			if masked.Bits() == 0 {
++				return nil, config.Errorf("LDAP STS trusted proxy %q is too broad", field)
++			}
++			prefixes = append(prefixes, masked)
+ 			continue
+ 		}
+ 
+diff --git a/internal/config/identity/ldap/ldap_test.go b/internal/config/identity/ldap/ldap_test.go
+index c5b89f681d2e8..f093e404ddb87 100644
+--- a/internal/config/identity/ldap/ldap_test.go
++++ b/internal/config/identity/ldap/ldap_test.go
+@@ -74,3 +74,12 @@ func TestSetSTSTrustedProxiesRejectsInvalidEntries(t *testing.T) {
+ 		t.Fatal("expected invalid trusted proxy list to fail")
+ 	}
+ }
++
++func TestSetSTSTrustedProxiesRejectsCatchAll(t *testing.T) {
++	for _, value := range []string{"0.0.0.0/0", "::/0", "192.0.2.0/24,0.0.0.0/0"} {
++		var cfg Config
++		if err := cfg.SetSTSTrustedProxies(value); err == nil {
++			t.Fatalf("expected catch-all trusted proxy %q to be rejected", value)
++		}
++	}
++}

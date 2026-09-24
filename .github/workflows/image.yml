@@ -1,0 +1,100 @@
+name: Build, verify, and release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  schedule:
+    - cron: '23 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: image-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-docker-action@2bf61fb9464cc67f0cbdeabed6aa0380accd1c70 # v5.5.0
+        with:
+          version: v29.8.0
+          daemon-config: '{"features":{"containerd-snapshotter":true}}'
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          driver: docker
+      - name: Build and run source regressions
+        env:
+          REVISION: ${{ github.sha }}
+        run: docker buildx build --platform linux/amd64 --load --build-arg REVISION="$REVISION" -t openimage/minio:ci .
+      - name: Smoke test
+        run: ./scripts/smoke.sh openimage/minio:ci
+      - name: Scan and assess known backports
+        run: ./scripts/scan.sh openimage/minio:ci
+      - name: Export corresponding source
+        run: docker buildx build --target source-export --output type=local,dest=build .
+      - name: Keep security evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: security-reports
+          path: reports/
+          retention-days: 30
+      - name: Keep verified release artifacts
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release
+          path: |
+            build/image.tar
+            build/minio-source.tar.gz
+            reports/
+          compression-level: 0
+          retention-days: 7
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: release
+      - uses: docker/setup-docker-action@2bf61fb9464cc67f0cbdeabed6aa0380accd1c70 # v5.5.0
+        with:
+          version: v29.8.0
+          daemon-config: '{"features":{"containerd-snapshotter":true}}'
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          username: openimage
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Publish matching source and evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          sha256sum build/minio-source.tar.gz reports/*.json > SHA256SUMS
+          cat > release-notes.md <<'EOF'
+          MinIO source build with OpenImage security backports.
+          The source archive contains vendored dependencies. Review raw.json
+          together with the image-specific vex.json and assessed.json.
+          Image: docker.io/openimage/minio, using this release's version tag.
+          EOF
+          gh release create "$GITHUB_REF_NAME" --verify-tag --title "$GITHUB_REF_NAME" \
+            --notes-file release-notes.md build/minio-source.tar.gz reports/*.json SHA256SUMS
+      - name: Push the tested image
+        run: |
+          docker load --input build/image.tar
+          docker tag openimage/minio:ci "openimage/minio:$GITHUB_REF_NAME"
+          docker push "openimage/minio:$GITHUB_REF_NAME"

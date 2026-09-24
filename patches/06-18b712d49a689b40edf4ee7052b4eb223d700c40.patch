@@ -1,0 +1,578 @@
+From 18b712d49a689b40edf4ee7052b4eb223d700c40 Mon Sep 17 00:00:00 2001
+From: Feng Ruohang <rh@vonng.com>
+Date: Thu, 16 Apr 2026 17:56:51 +0800
+Subject: [PATCH] fix: preserve LDAP STS rate limits without penalizing success
+
+---
+ cmd/sts-handlers.go      | 191 +++++++++++++++++++++++++++++----
+ cmd/sts-handlers_test.go | 224 +++++++++++++++++++++++++++++++++++----
+ 2 files changed, 375 insertions(+), 40 deletions(-)
+
+diff --git a/cmd/sts-handlers.go b/cmd/sts-handlers.go
+index 21e2195414f3a..e7753bcbd3b58 100644
+--- a/cmd/sts-handlers.go
++++ b/cmd/sts-handlers.go
+@@ -43,7 +43,6 @@ import (
+ 	"github.com/minio/mux"
+ 	"github.com/minio/pkg/v3/policy"
+ 	"github.com/minio/pkg/v3/wildcard"
+-	"golang.org/x/time/rate"
+ )
+ 
+ const (
+@@ -272,6 +271,11 @@ type stsLDAPLoginRateLimiter struct {
+ 	user   *stsLDAPLoginKeyLimiterSet
+ }
+ 
++type stsLDAPLoginReservation struct {
++	source *stsLDAPLoginKeyReservation
++	user   *stsLDAPLoginKeyReservation
++}
++
+ type stsLDAPLoginKeyLimiterSet struct {
+ 	mu          sync.Mutex
+ 	refillEvery time.Duration
+@@ -282,8 +286,16 @@ type stsLDAPLoginKeyLimiterSet struct {
+ }
+ 
+ type stsLDAPLoginKeyLimiter struct {
+-	limiter  *rate.Limiter
+-	lastSeen time.Time
++	tokens     float64
++	lastRefill time.Time
++	lastSeen   time.Time
++	inFlight   int
++}
++
++type stsLDAPLoginKeyReservation struct {
++	set       *stsLDAPLoginKeyLimiterSet
++	entry     *stsLDAPLoginKeyLimiter
++	finalized bool
+ }
+ 
+ func newSTSLDAPLoginRateLimiter(refillEvery time.Duration, burst int, ttl time.Duration) *stsLDAPLoginRateLimiter {
+@@ -302,21 +314,80 @@ func newSTSLDAPLoginKeyLimiterSet(refillEvery time.Duration, burst int, ttl time
+ 	}
+ }
+ 
++func normalizeSTSLDAPUsername(username string) string {
++	return strings.ToLower(strings.TrimSpace(username))
++}
++
+ func (l *stsLDAPLoginRateLimiter) Allow(sourceIP, username string) bool {
+-	now := UTCNow()
+-	if sourceIP != "" && !l.source.Allow(now, sourceIP) {
++	reservation := l.Reserve(sourceIP, username)
++	if reservation == nil {
+ 		return false
+ 	}
++	reservation.Commit()
++	return true
++}
+ 
+-	username = strings.ToLower(strings.TrimSpace(username))
+-	if username != "" && !l.user.Allow(now, username) {
+-		return false
++func (l *stsLDAPLoginRateLimiter) Reserve(sourceIP, username string) *stsLDAPLoginReservation {
++	now := UTCNow()
++	reservation := &stsLDAPLoginReservation{}
++
++	if sourceIP != "" {
++		reservation.source = l.source.Reserve(now, sourceIP)
++		if reservation.source == nil {
++			return nil
++		}
+ 	}
+ 
+-	return true
++	username = normalizeSTSLDAPUsername(username)
++	if username != "" {
++		reservation.user = l.user.Reserve(now, username)
++		if reservation.user == nil {
++			reservation.Cancel()
++			return nil
++		}
++	}
++
++	return reservation
++}
++
++func (r *stsLDAPLoginReservation) Commit() {
++	if r == nil {
++		return
++	}
++	if r.source != nil {
++		r.source.CommitAt(UTCNow())
++		r.source = nil
++	}
++	if r.user != nil {
++		r.user.CommitAt(UTCNow())
++		r.user = nil
++	}
++}
++
++func (r *stsLDAPLoginReservation) Cancel() {
++	if r == nil {
++		return
++	}
++	if r.source != nil {
++		r.source.CancelAt(UTCNow())
++		r.source = nil
++	}
++	if r.user != nil {
++		r.user.CancelAt(UTCNow())
++		r.user = nil
++	}
+ }
+ 
+ func (l *stsLDAPLoginKeyLimiterSet) Allow(now time.Time, key string) bool {
++	reservation := l.Reserve(now, key)
++	if reservation == nil {
++		return false
++	}
++	reservation.CommitAt(now)
++	return true
++}
++
++func (l *stsLDAPLoginKeyLimiterSet) Reserve(now time.Time, key string) *stsLDAPLoginKeyReservation {
+ 	l.mu.Lock()
+ 	defer l.mu.Unlock()
+ 
+@@ -325,30 +396,102 @@ func (l *stsLDAPLoginKeyLimiterSet) Allow(now time.Time, key string) bool {
+ 		l.lastCleanup = now
+ 	}
+ 
++	entry := l.getOrCreateLocked(now, key)
++	l.refillLocked(now, entry)
++	if entry.tokens < 1 {
++		entry.lastSeen = now
++		return nil
++	}
++
++	entry.tokens--
++	entry.inFlight++
++	entry.lastSeen = now
++	return &stsLDAPLoginKeyReservation{set: l, entry: entry}
++}
++
++func (l *stsLDAPLoginKeyLimiterSet) cleanup(now time.Time) {
++	for key, entry := range l.entries {
++		if entry.inFlight == 0 && now.Sub(entry.lastSeen) > l.ttl {
++			delete(l.entries, key)
++		}
++	}
++}
++
++func (l *stsLDAPLoginKeyLimiterSet) getOrCreateLocked(now time.Time, key string) *stsLDAPLoginKeyLimiter {
+ 	entry, ok := l.entries[key]
+ 	if !ok {
+ 		entry = &stsLDAPLoginKeyLimiter{
+-			limiter:  rate.NewLimiter(rate.Every(l.refillEvery), l.burst),
+-			lastSeen: now,
++			tokens:     float64(l.burst),
++			lastRefill: now,
++			lastSeen:   now,
+ 		}
+ 		l.entries[key] = entry
+-	} else {
+-		entry.lastSeen = now
++	}
++	return entry
++}
++
++func (l *stsLDAPLoginKeyLimiterSet) refillLocked(now time.Time, entry *stsLDAPLoginKeyLimiter) {
++	if entry.lastRefill.IsZero() {
++		entry.lastRefill = now
++	}
++
++	lastRefill := entry.lastRefill
++	if now.Before(lastRefill) {
++		lastRefill = now
++	}
++	if l.refillEvery <= 0 {
++		entry.lastRefill = now
++		entry.tokens = float64(l.burst)
++		return
+ 	}
+ 
+-	return entry.limiter.AllowN(now, 1)
++	entry.tokens += float64(now.Sub(lastRefill)) / float64(l.refillEvery)
++	if maxTokens := float64(l.burst); entry.tokens > maxTokens {
++		entry.tokens = maxTokens
++	}
++	entry.lastRefill = now
+ }
+ 
+-func (l *stsLDAPLoginKeyLimiterSet) cleanup(now time.Time) {
+-	for key, entry := range l.entries {
+-		if now.Sub(entry.lastSeen) > l.ttl {
+-			delete(l.entries, key)
++func (r *stsLDAPLoginKeyReservation) CommitAt(now time.Time) {
++	r.finalize(now, false)
++}
++
++func (r *stsLDAPLoginKeyReservation) CancelAt(now time.Time) {
++	r.finalize(now, true)
++}
++
++func (r *stsLDAPLoginKeyReservation) finalize(now time.Time, refund bool) {
++	if r == nil {
++		return
++	}
++
++	r.set.mu.Lock()
++	defer r.set.mu.Unlock()
++
++	if r.finalized {
++		return
++	}
++
++	r.set.refillLocked(now, r.entry)
++	r.entry.lastSeen = now
++	if r.entry.inFlight > 0 {
++		r.entry.inFlight--
++	}
++	if refund {
++		r.entry.tokens++
++		if maxTokens := float64(r.set.burst); r.entry.tokens > maxTokens {
++			r.entry.tokens = maxTokens
+ 		}
+ 	}
++
++	r.finalized = true
+ }
+ 
+-func allowSTSLDAPLogin(r *http.Request) bool {
+-	return globalSTSLDAPLoginRateLimiter.Allow(handlers.GetSourceIPRaw(r), r.Form.Get(stsLDAPUsername))
++// reserveSTSLDAPLogin acquires immediate tokens from the per-source and
++// per-username limiters before contacting LDAP. Call Commit on auth failures
++// and Cancel when the attempt should not count as an authentication failure.
++func reserveSTSLDAPLogin(r *http.Request) *stsLDAPLoginReservation {
++	return globalSTSLDAPLoginRateLimiter.Reserve(handlers.GetSourceIPRaw(r), r.Form.Get(stsLDAPUsername))
+ }
+ 
+ func ldapBindErrorToSTS(err error) (STSErrorCode, error) {
+@@ -806,20 +949,26 @@ func (sts *stsAPIHandlers) AssumeRoleWithLDAPIdentity(w http.ResponseWriter, r *
+ 		return
+ 	}
+ 
+-	if !allowSTSLDAPLogin(r) {
++	loginReservation := reserveSTSLDAPLogin(r)
++	if loginReservation == nil {
+ 		writeSTSThrottledResponse(w)
+ 		return
+ 	}
++	defer loginReservation.Cancel()
+ 
+ 	lookupResult, groupDistNames, err := globalIAMSys.LDAPConfig.Bind(ldapUsername, ldapPassword)
+ 	if err != nil {
+ 		errCode, errResp := ldapBindErrorToSTS(err)
+ 		if errCode == ErrSTSUpstreamError {
++			loginReservation.Cancel()
+ 			stsLogIf(ctx, err, logger.ErrorKind)
++		} else {
++			loginReservation.Commit()
+ 		}
+ 		writeSTSErrorResponse(ctx, w, errCode, errResp)
+ 		return
+ 	}
++	loginReservation.Cancel()
+ 	ldapUserDN := lookupResult.NormDN
+ 	ldapActualUserDN := lookupResult.ActualDN
+ 
+diff --git a/cmd/sts-handlers_test.go b/cmd/sts-handlers_test.go
+index 58786c1f1d50d..f8cd0c0c568b8 100644
+--- a/cmd/sts-handlers_test.go
++++ b/cmd/sts-handlers_test.go
+@@ -31,6 +31,8 @@ import (
+ 	"reflect"
+ 	"slices"
+ 	"strings"
++	"sync"
++	"sync/atomic"
+ 	"testing"
+ 	"time"
+ 
+@@ -990,6 +992,12 @@ type ldapSTSErrorResult struct {
+ 	Body       string
+ }
+ 
++type ldapSTSHTTPResult struct {
++	StatusCode int
++	RetryAfter string
++	Body       string
++}
++
+ func withGlobalSTSLDAPLoginRateLimiterForTest(limiter *stsLDAPLoginRateLimiter, fn func()) {
+ 	previous := globalSTSLDAPLoginRateLimiter
+ 	globalSTSLDAPLoginRateLimiter = limiter
+@@ -1000,7 +1008,7 @@ func withGlobalSTSLDAPLoginRateLimiterForTest(limiter *stsLDAPLoginRateLimiter,
+ 	fn()
+ }
+ 
+-func (s *TestSuiteIAM) postLDAPSTSForError(c *check, username, password string) ldapSTSErrorResult {
++func (s *TestSuiteIAM) postLDAPSTS(c *check, username, password string) ldapSTSHTTPResult {
+ 	c.Helper()
+ 
+ 	ctx, cancel := context.WithTimeout(context.Background(), testDefaultTimeout)
+@@ -1028,21 +1036,33 @@ func (s *TestSuiteIAM) postLDAPSTSForError(c *check, username, password string)
+ 	if err != nil {
+ 		c.Fatalf("unexpected LDAP STS response read error: %v", err)
+ 	}
+-	if resp.StatusCode == http.StatusOK {
+-		c.Fatalf("expected LDAP STS request to fail, got success: %s", body)
++
++	return ldapSTSHTTPResult{
++		StatusCode: resp.StatusCode,
++		RetryAfter: resp.Header.Get("Retry-After"),
++		Body:       string(body),
++	}
++}
++
++func (s *TestSuiteIAM) postLDAPSTSForError(c *check, username, password string) ldapSTSErrorResult {
++	c.Helper()
++
++	result := s.postLDAPSTS(c, username, password)
++	if result.StatusCode == http.StatusOK {
++		c.Fatalf("expected LDAP STS request to fail, got success: %s", result.Body)
+ 	}
+ 
+ 	var stsErr STSErrorResponse
+-	if err = xml.Unmarshal(body, &stsErr); err != nil {
+-		c.Fatalf("unexpected LDAP STS XML decode error: %v, body: %s", err, body)
++	if err := xml.Unmarshal([]byte(result.Body), &stsErr); err != nil {
++		c.Fatalf("unexpected LDAP STS XML decode error: %v, body: %s", err, result.Body)
+ 	}
+ 
+ 	return ldapSTSErrorResult{
+-		StatusCode: resp.StatusCode,
+-		RetryAfter: resp.Header.Get("Retry-After"),
++		StatusCode: result.StatusCode,
++		RetryAfter: result.RetryAfter,
+ 		Code:       stsErr.Error.Code,
+ 		Message:    stsErr.Error.Message,
+-		Body:       string(body),
++		Body:       result.Body,
+ 	}
+ }
+ 
+@@ -1102,6 +1122,42 @@ func (s *TestSuiteIAM) TestLDAPSTSRateLimit(c *check) {
+ 	)
+ }
+ 
++func (s *TestSuiteIAM) TestLDAPSTSSuccessDoesNotConsumeRateLimit(c *check) {
++	ctx, cancel := context.WithTimeout(context.Background(), testDefaultTimeout)
++	defer cancel()
++
++	userReq := madmin.PolicyAssociationReq{
++		Policies: []string{"consoleAdmin"},
++		User:     "uid=dillon,ou=people,ou=swengg,dc=min,dc=io",
++	}
++	if _, err := s.adm.AttachPolicyLDAP(ctx, userReq); err != nil {
++		c.Fatalf("unable to attach LDAP policy for success rate-limit test: %v", err)
++	}
++
++	withGlobalSTSLDAPLoginRateLimiterForTest(
++		newSTSLDAPLoginRateLimiter(time.Hour, 2, stsLDAPLoginEntryTTL),
++		func() {
++			for attempt := 1; attempt <= 3; attempt++ {
++				success := s.postLDAPSTS(c, "dillon", "dillon")
++				if success.StatusCode != http.StatusOK {
++					c.Fatalf("expected successful LDAP STS login on attempt %d, got status %d body: %s", attempt, success.StatusCode, success.Body)
++				}
++			}
++
++			firstFailure := s.postLDAPSTSForError(c, "dillon", "nottherightpassword")
++			secondFailure := s.postLDAPSTSForError(c, "dillon", "nottherightpassword")
++			throttled := s.postLDAPSTSForError(c, "dillon", "nottherightpassword")
++
++			if firstFailure.StatusCode != http.StatusBadRequest || secondFailure.StatusCode != http.StatusBadRequest {
++				c.Fatalf("expected failed auth attempts after successful logins to return %d, got %d and %d", http.StatusBadRequest, firstFailure.StatusCode, secondFailure.StatusCode)
++			}
++			if throttled.StatusCode != http.StatusTooManyRequests {
++				c.Fatalf("expected third failed auth attempt after successful logins to be throttled with %d, got %d", http.StatusTooManyRequests, throttled.StatusCode)
++			}
++		},
++	)
++}
++
+ func (s *TestSuiteIAM) TestLDAPSTSUpstreamFailure(c *check) {
+ 	original := globalIAMSys.LDAPConfig.Clone()
+ 	globalIAMSys.LDAPConfig.LDAP.ServerAddr = "127.0.0.1:1"
+@@ -1110,21 +1166,33 @@ func (s *TestSuiteIAM) TestLDAPSTSUpstreamFailure(c *check) {
+ 	}()
+ 
+ 	withGlobalSTSLDAPLoginRateLimiterForTest(
+-		newSTSLDAPLoginRateLimiter(time.Minute, stsLDAPLoginBurst, stsLDAPLoginEntryTTL),
++		newSTSLDAPLoginRateLimiter(time.Hour, 2, stsLDAPLoginEntryTTL),
+ 		func() {
+-			upstreamFailure := s.postLDAPSTSForError(c, "dillon", "dillon")
++			for range 3 {
++				upstreamFailure := s.postLDAPSTSForError(c, "dillon", "dillon")
+ 
+-			if upstreamFailure.StatusCode != http.StatusInternalServerError {
+-				c.Fatalf("expected upstream failure status %d, got %d", http.StatusInternalServerError, upstreamFailure.StatusCode)
+-			}
+-			if upstreamFailure.Code != "InternalError" {
+-				c.Fatalf("expected upstream failure code %q, got %q", "InternalError", upstreamFailure.Code)
++				if upstreamFailure.StatusCode != http.StatusInternalServerError {
++					c.Fatalf("expected upstream failure status %d, got %d", http.StatusInternalServerError, upstreamFailure.StatusCode)
++				}
++				if upstreamFailure.Code != "InternalError" {
++					c.Fatalf("expected upstream failure code %q, got %q", "InternalError", upstreamFailure.Code)
++				}
++				if upstreamFailure.Message != stsErrCodes.ToSTSErr(ErrSTSUpstreamError).Description {
++					c.Fatalf("expected upstream failure message %q, got %q", stsErrCodes.ToSTSErr(ErrSTSUpstreamError).Description, upstreamFailure.Message)
++				}
++				if upstreamFailure.Message == errLDAPAuthenticationFailed.Error() {
++					c.Fatalf("expected upstream failure to stay distinct from auth failure, got %q", upstreamFailure.Message)
++				}
+ 			}
+-			if upstreamFailure.Message != stsErrCodes.ToSTSErr(ErrSTSUpstreamError).Description {
+-				c.Fatalf("expected upstream failure message %q, got %q", stsErrCodes.ToSTSErr(ErrSTSUpstreamError).Description, upstreamFailure.Message)
++
++			globalIAMSys.LDAPConfig = original
++
++			authFailure := s.postLDAPSTSForError(c, "dillon", "nottherightpassword")
++			if authFailure.StatusCode == http.StatusTooManyRequests {
++				c.Fatalf("expected upstream failures not to consume rate limit budget, got throttled response: %+v", authFailure)
+ 			}
+-			if upstreamFailure.Message == errLDAPAuthenticationFailed.Error() {
+-				c.Fatalf("expected upstream failure to stay distinct from auth failure, got %q", upstreamFailure.Message)
++			if authFailure.StatusCode != http.StatusBadRequest {
++				c.Fatalf("expected auth failure after upstream recovery to return %d, got %d", http.StatusBadRequest, authFailure.StatusCode)
+ 			}
+ 		},
+ 	)
+@@ -1147,6 +1215,12 @@ func TestIAMWithLDAPSecurityServerSuite(t *testing.T) {
+ 				suite.TestLDAPSTSRateLimit(c)
+ 			},
+ 		},
++		{
++			name: "SuccessDoesNotConsumeRateLimit",
++			run: func(suite *TestSuiteIAM, c *check, ldapServer string) {
++				suite.TestLDAPSTSSuccessDoesNotConsumeRateLimit(c)
++			},
++		},
+ 		{
+ 			name: "UpstreamFailure",
+ 			run: func(suite *TestSuiteIAM, c *check, ldapServer string) {
+@@ -1297,6 +1371,118 @@ func TestSTSLDAPLoginRateLimiter(t *testing.T) {
+ 	}
+ }
+ 
++func TestSTSLDAPLoginRateLimiterReserveCancel(t *testing.T) {
++	limiter := newSTSLDAPLoginRateLimiter(time.Hour, 1, time.Minute)
++
++	reservation := limiter.Reserve("192.0.2.10", "dillon")
++	if reservation == nil {
++		t.Fatal("expected first reservation to succeed")
++	}
++	if limiter.Reserve("192.0.2.10", "kevin") != nil {
++		t.Fatal("expected second reservation on the same source IP to be throttled before cancel")
++	}
++
++	reservation.Cancel()
++
++	reservation = limiter.Reserve("192.0.2.10", "kevin")
++	if reservation == nil {
++		t.Fatal("expected canceled reservation to restore source-IP capacity")
++	}
++	reservation.Cancel()
++
++	reservation = limiter.Reserve("192.0.2.11", "dillon")
++	if reservation == nil {
++		t.Fatal("expected canceled reservation to restore username capacity")
++	}
++	reservation.Cancel()
++}
++
++func TestSTSLDAPLoginRateLimiterReserveRollbackOnCompositeFailure(t *testing.T) {
++	limiter := newSTSLDAPLoginRateLimiter(time.Hour, 1, time.Minute)
++
++	reservation := limiter.Reserve("192.0.2.10", "dillon")
++	if reservation == nil {
++		t.Fatal("expected initial reservation to succeed")
++	}
++	defer reservation.Cancel()
++
++	if limiter.Reserve("192.0.2.11", "dillon") != nil {
++		t.Fatal("expected second reservation for the same username to be throttled")
++	}
++
++	reservation2 := limiter.Reserve("192.0.2.11", "kevin")
++	if reservation2 == nil {
++		t.Fatal("expected throttled username reservation to roll back the provisional source-IP reservation")
++	}
++	reservation2.Cancel()
++}
++
++func TestSTSLDAPLoginRateLimiterConcurrentReserveLifecycle(t *testing.T) {
++	limiter := newSTSLDAPLoginRateLimiter(time.Hour, 4, time.Minute)
++
++	const workers = 8
++	start := make(chan struct{})
++	finish := make(chan struct{})
++	var wg sync.WaitGroup
++	var reserveWG sync.WaitGroup
++	reservations := make([]*stsLDAPLoginReservation, workers)
++	var canceledReservations atomic.Int32
++
++	reserveWG.Add(workers)
++	for i := 0; i < workers; i++ {
++		wg.Add(1)
++		go func(worker int) {
++			defer wg.Done()
++			<-start
++
++			reservations[worker] = limiter.Reserve("192.0.2.10", "dillon")
++			reserveWG.Done()
++			if reservations[worker] == nil {
++				return
++			}
++
++			<-finish
++			if worker%2 == 0 {
++				canceledReservations.Add(1)
++				reservations[worker].Cancel()
++				return
++			}
++
++			reservations[worker].Commit()
++		}(i)
++	}
++
++	close(start)
++	reserveWG.Wait()
++
++	successfulReservations := 0
++	for _, reservation := range reservations {
++		if reservation != nil {
++			successfulReservations++
++		}
++	}
++	if got := successfulReservations; got != 4 {
++		t.Fatalf("expected exactly 4 successful concurrent reservations, got %d", got)
++	}
++
++	close(finish)
++	wg.Wait()
++
++	remainingBudget := 0
++	for {
++		reservation := limiter.Reserve("192.0.2.10", "dillon")
++		if reservation == nil {
++			break
++		}
++		remainingBudget++
++		reservation.Commit()
++	}
++
++	if want, got := int(canceledReservations.Load()), remainingBudget; got != want {
++		t.Fatalf("expected %d tokens to remain after concurrent commit/cancel mix, got %d", want, got)
++	}
++}
++
+ func TestLDAPBindErrorToSTS(t *testing.T) {
+ 	tests := []struct {
+ 		name    string

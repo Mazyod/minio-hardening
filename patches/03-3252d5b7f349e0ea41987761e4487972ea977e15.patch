@@ -1,0 +1,245 @@
+From 3252d5b7f349e0ea41987761e4487972ea977e15 Mon Sep 17 00:00:00 2001
+From: Feng Ruohang <rh@vonng.com>
+Date: Wed, 15 Apr 2026 22:55:52 +0800
+Subject: [PATCH] fix: CVE-2026-39414 harden S3 Select oversized record
+ handling
+
+Enforce the 1 MiB maxCharsPerRecord limit while splitting CSV and line-delimited JSON input so oversized records are rejected before they can be buffered and parsed.
+
+Return OverMaxRecordSize for these failures instead of collapsing them into InternalError, and preserve splitter errors in the JSON worker so oversized-record failures are not lost after successful partial decode.
+---
+ internal/s3select/csv/errors.go   | 11 +++++++
+ internal/s3select/csv/reader.go   | 51 ++++++++++++++++++++++++++++---
+ internal/s3select/json/errors.go  | 13 ++++++++
+ internal/s3select/json/preader.go | 48 ++++++++++++++++++++++++++---
+ internal/s3select/select.go       |  4 +++
+ 5 files changed, 118 insertions(+), 9 deletions(-)
+
+diff --git a/internal/s3select/csv/errors.go b/internal/s3select/csv/errors.go
+index 391c1ac441e7f..bc85eb1e03a3d 100644
+--- a/internal/s3select/csv/errors.go
++++ b/internal/s3select/csv/errors.go
+@@ -19,6 +19,8 @@ package csv
+ 
+ import "errors"
+ 
++var errLineTooLong = errors.New("line exceeds maximum allowed length")
++
+ type s3Error struct {
+ 	code       string
+ 	message    string
+@@ -55,6 +57,15 @@ func errCSVParsingError(err error) *s3Error {
+ 	}
+ }
+ 
++func errOverMaxRecordSize(err error) *s3Error {
++	return &s3Error{
++		code:       "OverMaxRecordSize",
++		message:    "The length of a record in the input or result is greater than maxCharsPerRecord of 1 MB.",
++		statusCode: 400,
++		cause:      err,
++	}
++}
++
+ func errInvalidTextEncodingError() *s3Error {
+ 	return &s3Error{
+ 		code:       "InvalidTextEncoding",
+diff --git a/internal/s3select/csv/reader.go b/internal/s3select/csv/reader.go
+index 66110983027a7..161ecc16fd975 100644
+--- a/internal/s3select/csv/reader.go
++++ b/internal/s3select/csv/reader.go
+@@ -139,10 +139,44 @@ func (r *Reader) nextSplit(skip int, dst []byte) ([]byte, error) {
+ 			return dst, io.EOF
+ 		}
+ 	}
+-	// Read until next line.
+-	in, err := r.buf.ReadBytes('\n')
+-	dst = append(dst, in...)
+-	return dst, err
++
++	// Track how much of the last logical record is already present in the
++	// prefetched block so we enforce the 1 MiB record-size limit rather than a
++	// smaller implicit block-size limit.
++	tailLen := len(dst)
++	if i := bytes.LastIndexByte(dst, '\n'); i >= 0 {
++		tailLen = len(dst) - i - 1
++	}
++	tailStart := len(dst) - tailLen
++	if tailLen > maxCharsPerRecord {
++		return dst[:tailStart], errOverMaxRecordSize(errLineTooLong)
++	}
++
++	// Read until the next line while keeping the last record within the S3
++	// Select 1 MiB record-size limit.
++	for {
++		in, err := r.buf.ReadSlice('\n')
++		switch err {
++		case nil:
++			if tailLen+len(in)-1 > maxCharsPerRecord {
++				return dst[:tailStart], errOverMaxRecordSize(errLineTooLong)
++			}
++			dst = append(dst, in...)
++			return dst, nil
++		case bufio.ErrBufferFull:
++			if tailLen+len(in) > maxCharsPerRecord {
++				return dst[:tailStart], errOverMaxRecordSize(errLineTooLong)
++			}
++			dst = append(dst, in...)
++			tailLen += len(in)
++		default:
++			if tailLen+len(in) > maxCharsPerRecord {
++				return dst[:tailStart], errOverMaxRecordSize(errLineTooLong)
++			}
++			dst = append(dst, in...)
++			return dst, err
++		}
++	}
+ }
+ 
+ // csvSplitSize is the size of each block.
+@@ -150,6 +184,9 @@ func (r *Reader) nextSplit(skip int, dst []byte) ([]byte, error) {
+ // 128KB appears to be a very reasonable default.
+ const csvSplitSize = 128 << 10
+ 
++// S3 Select allows up to 1 MiB per input record.
++const maxCharsPerRecord = 1 << 20
++
+ // startReaders will read the header if needed and spin up a parser
+ // and a number of workers based on GOMAXPROCS.
+ // If an error is returned no goroutines have been started and r.err will have been set.
+@@ -234,6 +271,12 @@ func (r *Reader) startReaders(newReader func(io.Reader) *csv.Reader) error {
+ 		go func() {
+ 			for in := range r.input {
+ 				if len(in.input) == 0 {
++					if in.input != nil {
++						// Return empty pooled buffers as well. This happens on
++						// oversized line errors where parsing is intentionally skipped.
++						r.bufferPool.Put(in.input[:0])
++						in.input = nil
++					}
+ 					in.dst <- nil
+ 					continue
+ 				}
+diff --git a/internal/s3select/json/errors.go b/internal/s3select/json/errors.go
+index f1efa64b21ca4..a438a6fd7d71a 100644
+--- a/internal/s3select/json/errors.go
++++ b/internal/s3select/json/errors.go
+@@ -17,6 +17,10 @@
+ 
+ package json
+ 
++import "errors"
++
++var errLineTooLong = errors.New("line exceeds maximum allowed length")
++
+ type s3Error struct {
+ 	code       string
+ 	message    string
+@@ -61,3 +65,12 @@ func errJSONParsingError(err error) *s3Error {
+ 		cause:      err,
+ 	}
+ }
++
++func errOverMaxRecordSize(err error) *s3Error {
++	return &s3Error{
++		code:       "OverMaxRecordSize",
++		message:    "The length of a record in the input or result is greater than maxCharsPerRecord of 1 MB.",
++		statusCode: 400,
++		cause:      err,
++	}
++}
+diff --git a/internal/s3select/json/preader.go b/internal/s3select/json/preader.go
+index a9ef1343585f2..64b52d353daf1 100644
+--- a/internal/s3select/json/preader.go
++++ b/internal/s3select/json/preader.go
+@@ -118,10 +118,39 @@ func (r *PReader) nextSplit(skip int, dst []byte) ([]byte, error) {
+ 			return dst, io.EOF
+ 		}
+ 	}
+-	// Read until next line.
+-	in, err := r.buf.ReadBytes('\n')
+-	dst = append(dst, in...)
+-	return dst, err
++
++	tailLen := len(dst)
++	if i := bytes.LastIndexByte(dst, '\n'); i >= 0 {
++		tailLen = len(dst) - i - 1
++	}
++	tailStart := len(dst) - tailLen
++	if tailLen > maxCharsPerRecord {
++		return dst[:tailStart], errOverMaxRecordSize(errLineTooLong)
++	}
++
++	for {
++		in, err := r.buf.ReadSlice('\n')
++		switch err {
++		case nil:
++			if tailLen+len(in)-1 > maxCharsPerRecord {
++				return dst[:tailStart], errOverMaxRecordSize(errLineTooLong)
++			}
++			dst = append(dst, in...)
++			return dst, nil
++		case bufio.ErrBufferFull:
++			if tailLen+len(in) > maxCharsPerRecord {
++				return dst[:tailStart], errOverMaxRecordSize(errLineTooLong)
++			}
++			dst = append(dst, in...)
++			tailLen += len(in)
++		default:
++			if tailLen+len(in) > maxCharsPerRecord {
++				return dst[:tailStart], errOverMaxRecordSize(errLineTooLong)
++			}
++			dst = append(dst, in...)
++			return dst, err
++		}
++	}
+ }
+ 
+ // jsonSplitSize is the size of each block.
+@@ -129,6 +158,9 @@ func (r *PReader) nextSplit(skip int, dst []byte) ([]byte, error) {
+ // 128KB appears to be a very reasonable default.
+ const jsonSplitSize = 128 << 10
+ 
++// S3 Select allows up to 1 MiB per input record.
++const maxCharsPerRecord = 1 << 20
++
+ // startReaders will read the header if needed and spin up a parser
+ // and a number of workers based on GOMAXPROCS.
+ // If an error is returned no goroutines have been started and r.err will have been set.
+@@ -177,6 +209,10 @@ func (r *PReader) startReaders() {
+ 		go func() {
+ 			for in := range r.input {
+ 				if len(in.input) == 0 {
++					if in.input != nil {
++						r.bufferPool.Put(in.input[:0])
++						in.input = nil
++					}
+ 					in.dst <- nil
+ 					continue
+ 				}
+@@ -207,7 +243,9 @@ func (r *PReader) startReaders() {
+ 				//nolint:staticcheck // SA6002 Using pointer would allocate more since we would have to copy slice header before taking a pointer.
+ 				r.bufferPool.Put(in.input)
+ 				in.input = nil
+-				in.err = d.Err()
++				if err := d.Err(); err != nil {
++					in.err = err
++				}
+ 				in.dst <- all
+ 			}
+ 		}()
+diff --git a/internal/s3select/select.go b/internal/s3select/select.go
+index a5dfc7b17cffb..2aa9237741a3b 100644
+--- a/internal/s3select/select.go
++++ b/internal/s3select/select.go
+@@ -658,6 +658,10 @@ OuterLoop:
+ 	}
+ 
+ 	if err != nil {
++		if serr, ok := err.(SelectError); ok && serr.ErrorCode() == "OverMaxRecordSize" {
++			_ = writer.FinishWithError(serr.ErrorCode(), serr.ErrorMessage())
++			return
++		}
+ 		_ = writer.FinishWithError("InternalError", err.Error())
+ 	}
+ }

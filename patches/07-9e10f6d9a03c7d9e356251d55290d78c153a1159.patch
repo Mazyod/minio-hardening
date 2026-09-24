@@ -1,0 +1,227 @@
+From 9e10f6d9a03c7d9e356251d55290d78c153a1159 Mon Sep 17 00:00:00 2001
+From: Feng Ruohang <rh@vonng.com>
+Date: Thu, 16 Apr 2026 21:21:53 +0800
+Subject: [PATCH] fix: harden LDAP STS rate-limit source IP
+
+Use the socket peer address for LDAP STS per-IP rate limiting instead of the generic forwarded-header-aware helper. This keeps the security-sensitive rate-limit key from trusting spoofable X-Forwarded-For, X-Real-IP, and Forwarded headers while leaving the rest of the source-IP behavior unchanged.
+
+Add focused regression coverage for RemoteAddr parsing, header spoofing, and peer-address bucket selection.
+---
+ cmd/sts-handlers.go      |  12 ++-
+ cmd/sts-handlers_test.go | 162 +++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 172 insertions(+), 2 deletions(-)
+
+diff --git a/cmd/sts-handlers.go b/cmd/sts-handlers.go
+index e7753bcbd3b58..513e5b3d2e5bd 100644
+--- a/cmd/sts-handlers.go
++++ b/cmd/sts-handlers.go
+@@ -25,6 +25,7 @@ import (
+ 	"encoding/json"
+ 	"errors"
+ 	"fmt"
++	"net"
+ 	"net/http"
+ 	"net/url"
+ 	"strconv"
+@@ -36,7 +37,6 @@ import (
+ 	"github.com/minio/minio/internal/auth"
+ 	idldap "github.com/minio/minio/internal/config/identity/ldap"
+ 	"github.com/minio/minio/internal/config/identity/openid"
+-	"github.com/minio/minio/internal/handlers"
+ 	"github.com/minio/minio/internal/hash/sha256"
+ 	xhttp "github.com/minio/minio/internal/http"
+ 	"github.com/minio/minio/internal/logger"
+@@ -487,11 +487,19 @@ func (r *stsLDAPLoginKeyReservation) finalize(now time.Time, refund bool) {
+ 	r.finalized = true
+ }
+ 
++func getSTSLDAPLoginSourceIP(r *http.Request) string {
++	sourceIP, _, err := net.SplitHostPort(r.RemoteAddr)
++	if err == nil {
++		return sourceIP
++	}
++	return r.RemoteAddr
++}
++
+ // reserveSTSLDAPLogin acquires immediate tokens from the per-source and
+ // per-username limiters before contacting LDAP. Call Commit on auth failures
+ // and Cancel when the attempt should not count as an authentication failure.
+ func reserveSTSLDAPLogin(r *http.Request) *stsLDAPLoginReservation {
+-	return globalSTSLDAPLoginRateLimiter.Reserve(handlers.GetSourceIPRaw(r), r.Form.Get(stsLDAPUsername))
++	return globalSTSLDAPLoginRateLimiter.Reserve(getSTSLDAPLoginSourceIP(r), r.Form.Get(stsLDAPUsername))
+ }
+ 
+ func ldapBindErrorToSTS(err error) (STSErrorCode, error) {
+diff --git a/cmd/sts-handlers_test.go b/cmd/sts-handlers_test.go
+index f8cd0c0c568b8..6dc43af91c985 100644
+--- a/cmd/sts-handlers_test.go
++++ b/cmd/sts-handlers_test.go
+@@ -1483,6 +1483,168 @@ func TestSTSLDAPLoginRateLimiterConcurrentReserveLifecycle(t *testing.T) {
+ 	}
+ }
+ 
++func TestGetSTSLDAPLoginSourceIP(t *testing.T) {
++	tests := []struct {
++		name       string
++		remoteAddr string
++		want       string
++	}{
++		{name: "empty", remoteAddr: "", want: ""},
++		{name: "ipv4", remoteAddr: "192.0.2.10:9000", want: "192.0.2.10"},
++		{name: "ipv6", remoteAddr: "[2001:db8::10]:9000", want: "2001:db8::10"},
++		{name: "bare-host", remoteAddr: "192.0.2.10", want: "192.0.2.10"},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			req := &http.Request{RemoteAddr: tt.remoteAddr}
++			if got := getSTSLDAPLoginSourceIP(req); got != tt.want {
++				t.Fatalf("expected %q, got %q", tt.want, got)
++			}
++		})
++	}
++}
++
++func TestGetSTSLDAPLoginSourceIPIgnoresSpoofedForwardingHeaders(t *testing.T) {
++	tests := []struct {
++		name        string
++		headerKey   string
++		headerValue string
++	}{
++		{
++			name:        "x-forwarded-for",
++			headerKey:   "X-Forwarded-For",
++			headerValue: "203.0.113.10, 198.51.100.24",
++		},
++		{
++			name:        "x-real-ip",
++			headerKey:   "X-Real-IP",
++			headerValue: "203.0.113.10",
++		},
++		{
++			name:        "forwarded",
++			headerKey:   "Forwarded",
++			headerValue: `for=203.0.113.10;proto=https`,
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			req := &http.Request{
++				Header:     http.Header{tt.headerKey: []string{tt.headerValue}},
++				RemoteAddr: "192.0.2.10:9000",
++			}
++
++			if got := getSTSLDAPLoginSourceIP(req); got != "192.0.2.10" {
++				t.Fatalf("expected helper to ignore spoofed %s and return peer address, got %q", tt.headerKey, got)
++			}
++		})
++	}
++}
++
++func TestReserveSTSLDAPLoginUsesPeerAddressBuckets(t *testing.T) {
++	tests := []struct {
++		name        string
++		headerKey   string
++		firstValue  string
++		secondValue string
++	}{
++		{
++			name:        "x-forwarded-for",
++			headerKey:   "X-Forwarded-For",
++			firstValue:  "203.0.113.10",
++			secondValue: "198.51.100.23, 198.51.100.24",
++		},
++		{
++			name:        "x-real-ip",
++			headerKey:   "X-Real-IP",
++			firstValue:  "203.0.113.10",
++			secondValue: "198.51.100.23",
++		},
++		{
++			name:        "forwarded",
++			headerKey:   "Forwarded",
++			firstValue:  `for=203.0.113.10;proto=https`,
++			secondValue: `for=198.51.100.23;proto=https`,
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name+"-same-peer", func(t *testing.T) {
++			limiter := newSTSLDAPLoginRateLimiter(time.Hour, 2, time.Minute)
++			withGlobalSTSLDAPLoginRateLimiterForTest(limiter, func() {
++				req1 := &http.Request{
++					Header:     http.Header{tt.headerKey: []string{tt.firstValue}},
++					RemoteAddr: "192.0.2.10:9000",
++					Form:       url.Values{stsLDAPUsername: []string{"alice"}},
++				}
++				req2 := &http.Request{
++					Header:     http.Header{tt.headerKey: []string{tt.secondValue}},
++					RemoteAddr: "192.0.2.10:9001",
++					Form:       url.Values{stsLDAPUsername: []string{"bob"}},
++				}
++
++				reservation1 := reserveSTSLDAPLogin(req1)
++				if reservation1 == nil {
++					t.Fatal("expected first reservation to succeed")
++				}
++				defer reservation1.Cancel()
++
++				reservation2 := reserveSTSLDAPLogin(req2)
++				if reservation2 == nil {
++					t.Fatal("expected second reservation to succeed with shared source bucket capacity")
++				}
++				defer reservation2.Cancel()
++
++				if got := len(limiter.source.entries); got != 1 {
++					t.Fatalf("expected requests from the same peer address to share one source bucket, got %d", got)
++				}
++				if _, ok := limiter.source.entries["192.0.2.10"]; !ok {
++					t.Fatalf("expected source bucket for peer address %q, got keys %v", "192.0.2.10", limiter.source.entries)
++				}
++			})
++		})
++
++		t.Run(tt.name+"-different-peers", func(t *testing.T) {
++			limiter := newSTSLDAPLoginRateLimiter(time.Hour, 1, time.Minute)
++			withGlobalSTSLDAPLoginRateLimiterForTest(limiter, func() {
++				req1 := &http.Request{
++					Header:     http.Header{tt.headerKey: []string{tt.firstValue}},
++					RemoteAddr: "192.0.2.10:9000",
++					Form:       url.Values{stsLDAPUsername: []string{"alice"}},
++				}
++				req2 := &http.Request{
++					Header:     http.Header{tt.headerKey: []string{tt.firstValue}},
++					RemoteAddr: "192.0.2.11:9000",
++					Form:       url.Values{stsLDAPUsername: []string{"bob"}},
++				}
++
++				reservation1 := reserveSTSLDAPLogin(req1)
++				if reservation1 == nil {
++					t.Fatal("expected first reservation to succeed")
++				}
++				defer reservation1.Cancel()
++
++				reservation2 := reserveSTSLDAPLogin(req2)
++				if reservation2 == nil {
++					t.Fatal("expected second reservation from a different peer address to succeed")
++				}
++				defer reservation2.Cancel()
++
++				if got := len(limiter.source.entries); got != 2 {
++					t.Fatalf("expected requests from different peer addresses to use different source buckets, got %d", got)
++				}
++				if _, ok := limiter.source.entries["192.0.2.10"]; !ok {
++					t.Fatalf("expected source bucket for peer address %q, got keys %v", "192.0.2.10", limiter.source.entries)
++				}
++				if _, ok := limiter.source.entries["192.0.2.11"]; !ok {
++					t.Fatalf("expected source bucket for peer address %q, got keys %v", "192.0.2.11", limiter.source.entries)
++				}
++			})
++		})
++	}
++}
++
+ func TestLDAPBindErrorToSTS(t *testing.T) {
+ 	tests := []struct {
+ 		name    string
