@@ -70,7 +70,7 @@ jobs:
     steps:
       - name: Require a public Docker Hub repository
         run: curl -fsS https://hub.docker.com/v2/namespaces/openimage/repositories/minio | jq -e '.is_private == false' >/dev/null
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: release
       - uses: docker/setup-docker-action@2bf61fb9464cc67f0cbdeabed6aa0380accd1c70 # v5.5.0
